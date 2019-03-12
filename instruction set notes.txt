@@ -1,0 +1,110 @@
+Legacy instructions
+AAA
+AAD
+AAM
+AAS
+ARPL
+BOUND
+
+op *AX,imm
+Instr   8bit        16bit       32bit           64bit
+                    (with 66)                   (with REX.W)
+ADC     14 ib       15 iw       15 id           15 id
+ADD     04 ib       05 iw       05 iw           05 id
+AND     24 ib       25 iw       25 id           25 id
+
+op r/m,imm (MI)
+ADC     80/2 ib     81/2 iw     81/2 id         81/2 id
+ADC                 83/2 ib     83/2 ib         83/2 ib
+ADD     80/0 ib     81/0 iw     81/0 id         81/0 id
+ADD                 83/2 ib     83/2 ib         83/2 ib
+AND     80/4 ib     81/4 iw     81/4 id         81/4 id
+AND                 83/4 ib     83/4 ib         83/4 ib
+BT                  0F BA/4 ib  0F BA/4 ib      0F BA/4 ib
+BTC                 0F BA/7 ib  0F BA/7 ib      0F BA/7 ib
+BTR                 0F BA/6 ib  0F BA/6 ib      0F BA/6 ib
+BTS                 0F BA/5 ib  0F BA/5 ib      0F BA/5 ib
+
+op r/m,r (MR)
+ADC     10/r        +           11/r            +
+ADD     00/r        +           01/r            +
+AND     20/r        +           21/r            +
+BT                  +           0F A3/r         +
+BTC                 +           0F BB/r         +
+BTR                 +           0F B3/r         +
+BTS                 +           0F AB/r         +
+
+op r,r/m (RM)
+ADC     12/r        +           13/r            +
+ADCX                            66 0F 38 F6/r   +
+ADD     02/r        +           03/r            +
+ADOX                            F3 0F 38 F6/r   +
+AND     22/r        +           23/r            +
+BSF                 +           0F BC/r         +
+BSR                 +           0F BD/r         +
+
+(O)
+BSWAP                           0F C8+rd        +
+
+VEX-encoded scalar instructions. RVM
+Instr   32-bit      64-bit
+ANDN    0F 38 F2/r  +
+BEXTR   0F 38 F7/r  +
+
+VEX-encoded scalar instructions. RMV
+Instr   32-bit      64-bit
+BZHI    0F 38 F5/r  +
+
+VEX-encoded scalar instructions. VM
+Instr   32-bit      64-bit
+BLSI    0F 38 F3/3  +
+BLSMSK  0F 38 F3/2  +
+BLSR    0F 38 F3/1  +
+
+LEA-like (lots of special cases here)
+Instr   32-bit      64-bit
+BNDCL   F3 0F 1A/r  +
+BNDCN   F2 0F 1A/r  +
+BNDCU   F2 0F 1B/r  +
+BNDLDX              0F 1A/r
+BNDMK               0F 1B/r
+BNDMOV              66 0F 1A/r
+BNDMOV              66 0F 1B/r
+BNDSTX              0F 1B/r
+
+
+Vector instructions (two source operand)
+Instr       SSE-encoded     VEX.128     VEX.256     EVEX.128    EVEX.256    EVEX.512
+ADDPD       66 0F 58/r      +           +           +           +           +
+ADDPS       0F 58/r         +           +           +           +           +
+ADDSD       F2 0F 58/r      +                       +
+ADDSS       F3 0F 58/r      +                       +
+ADDSUBPD    66 0F D0/r      +           +
+ADDSUBPS    F2 0F D0/r      +           +
+AESDEC      66 0F 38 DE/r   +
+AESDECLAST  66 0F 38 DF/r   +
+AESENC      66 0F 38 DC/r   +
+AESENCLAST  66 0F 38 DD/r   +
+ANDPD       66 0F 54/r      +           +           +           +           +
+ANDPS       0F 54/r         +           +           +           +           +
+ANDNPD      66 0F 55/r      +           +           +           +           +
+ANDNPS      0F 55/r         +           +           +           +           +
+
+Vector instructions (single source operand)
+Instr       SSE-encoded     VEX.128     VEX.256     EVEX.128    EVEX.256    EVEX.512
+AESIMC      66 0F 38 D8/r   +
+
+Vector instructions (single source operand with imm)
+Instr       SSE-encoded         VEX.128     VEX.256     EVEX.128    EVEX.256    EVEX.512
+AESKEYGENAS 66 0F 3A DF /r ib   +
+
+Vector instructions (two source operands with imm)
+Instr       SSE-encoded         VEX.128     VEX.256     EVEX.128    EVEX.256    EVEX.512
+BLENDPD     66 0F 3A 0D/r ib    +           +
+BLENDPS     66 0F 3A 0C/r ib    +           +
+
+Vector instructions (three source operands)
+Instr       SSE-encoded         VEX.128     VEX.256     EVEX.128    EVEX.256    EVEX.512
+BLENDVPD    66 0F 38 15/r       +           +
+BLENDVPS    66 0F 38 14/r       +           +
+

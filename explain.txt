@@ -1,0 +1,112 @@
+This is a vector:
+
+> xs = [0b,1b,0b]
+
+It consists of exactly three bits. There aren't any available registers on your cpu that are exactly three bits, so it will be padded out with zeros.
+
+You can concatenate vectors like so:
+
+> xs = xs ++ xs
+
+You can perform other operations on vectors:
+
+> xs = xs.map(x -> !x)
+
+This looks like it would perform the computation one bit at a time, but this isn't the case. The type of x inside that lambda is also a vector, and it will have as many bits as the compiler deems efficient.
+
+The return value of the lambda doesn't need to be the same length as the input value:
+
+> xs = xs.map(sign_extend_bit_to_byte)
+
+The sign_extend_bit_to_byte function takes as its input a single bit (or a vector of them) and returns a single byte (or a vector of them) where each byte is all zeros or all ones.
+
+xs has now changed type - it's a vector of bytes, not a vector of bits. But we can turn it back into a vector of bits by reinterpreting the bytes:
+
+> xs =~ xs.map(byte_as_bits)
+
+The =~ is a clue that we're changing the type of something but not changing the actual data stored. It will be compiled to a no-op, and the compiler will complain if it sees =~ but you're trying to do something that isn't a no-op.
+
+Functions such as sign_extend_bit_to_byte and byte_as_bits operate on vectors. So why do we call .map() on them instead of just passing the original vector xs to them? The answer is that it's a clue to the compiler that the vector xs can be split up any which way and still generate an acceptable answer.
+
+Not all functions do sensible things when you call map. For example:
+
+> ys = xs.map(length)
+
+This will return a vector of usize, where each element is the size of one of the blocks that the vector was carved into. But this is somewhat arbitrary. Whether the compiler actually lets you do this I'm not sure. There may be valid uses for it.
+
+You can define structures.
+
+> struct coord {
+>    x: i64,
+>    y: i64
+> }
+
+However, a vector of structs will be stored in columnar format, instead of interleaved.
+
+Structures can themselves contain vectors. In this case, the values will be interleaved.
+
+More interestingly, the vectors can have a length parameterized by another member of the structure.
+
+> struct vectorlets {
+>    size: usize,
+>    data: [u8;size]
+> }
+
+The data values will be stored in memory all concatenated together, with only the size values to tell where one ends and the next starts.
+
+An operation like adding one should be simple enough:
+
+> xs = [1,2,3]u8
+> xs = xs + 1
+
+But the compiler needs to check that it's not going to overflow. In this case it's easy enough to check because the values are all written out there and they're all <=254.
+
+But what if they were unknown?
+
+!> myfn : [u8] -> [u8]
+!> myfn xs = xs + 1
+
+This isn't valid. But the following is:
+
+> myfn : [u8] -> [u8]
+> myfn xs = xs.min(254) + 1
+
+What's going on inside the compiler that it knows this is ok but the other one wasn't?
+
+There's a form of precondition here. But it's a precondition on the output: we say you're allowed to store a+b in a u8 if a+b actually fits in a u8.
+
+So using + carries a proof obligation. In fact three:
+
+1) a+b is an integer
+2) a+b >= 0
+3) a+b <= 255
+
+Two of these we can dispatch easily. Adding integers yields an integer, and adding nonnegative things yields a nonnegative thing. The compiler should notice that this is what's going on and not trouble you to "prove" it.
+
+The last one is where some intervention might come in. I'm imagining the compiler would remember a few miscellaneous facts about each item, and if you've just called .min(254) it should certainly remember that it's <=254. That combined with the fact that b is the literal 1, should give us a+b <= 255.
+
+Remembering bounds on things is such a basic thing that the compiler should do it automatically where it can. But until that's implemented, and for other things, you'll have to get your hands dirty and prove stuff. How?
+
+(to be considered later)
+
+Vectors data is usually processed in sequence order. This means if you chain operations together like so:
+
+> xs = [1u8;256]
+> ys = [2u8;256]
+> zs = [3u8;256]
+> xs = xs.addwrap(ys).addwrap(zs)
+
+Then it won't construct an intermediate value in memory. Instead it will generate something like:
+
+movdqa zmm0, [xs+rax]
+paddb zmm0, [ys+rax]
+paddb zmm0, [zs+rax]
+movdqa [xs'+rax], zmm0
+
+and run it in a loop.
+
+This means it needs a notion of coroutines. In the case of zipping things which are generated at different rates, it will need to jump from one block of code to the other depending on which is currently behind.
+
+(Actually in this example it wouldn't load things from memory because they're initialized completely uniformly).
+
+
