@@ -4,8 +4,9 @@ import Control.Applicative ((<|>))
 import Text.Parsec.String (Parser,parseFromFile)
 import Text.Parsec.Char (letter,oneOf,char,string,digit)
 import Text.Parsec.Combinator (many1,skipMany1,optional,optionMaybe,sepBy)
+import Data.Word (Word8)
 
-data Expr = LiteralListu8 [Int] | Literalu8 Int | Var String | MethodCall Expr String [Expr] deriving Show
+data Expr = LiteralListu8 [Word8] | Literalu8 Word8 | Var String | MethodCall Expr String [Expr] deriving Show
 data Statement = Noop | Assign String Expr deriving Show
 
 -------------------------
@@ -87,7 +88,7 @@ word_expr = do
 u8_expr :: Parser Expr
 u8_expr = do
     n <- number_u8
-    return $ Literalu8 n
+    return $ Literalu8 (fromIntegral n)
 
 expr1 :: Parser Expr
 expr1 = literal_list <|> word_expr <|> u8_expr
