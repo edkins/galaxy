@@ -19,7 +19,7 @@ instance Monoid Code where
 ------------------
 movdqa_rm = I_66_0F 0x6f
 mov_oi8 = Old_OI 1 0xb0 -- 0xb0 thru 0xb7
-vpbroadcastb_rm = I_66_0F38 0x78
+evpbroadcastb_gpr_rm = I_66_0F38 0x7a
 paddb_rm = I_66_0F 0xfc
 
 ------------------
@@ -38,6 +38,9 @@ qw w = Code (word64LE w) 8
 bytes :: [Word8] -> Code
 bytes [] = mempty
 bytes (x:xs) = b x <> bytes xs
+
+strbytes :: String -> Code
+strbytes str = Code (string7 str) (length str)
 
 clength :: Code -> Int
 clength (Code _ l) = l
@@ -69,6 +72,13 @@ vex128_rm (I_66_0F38 op) r rm =
     in
         vx <> b op <> modrm_sib_disp r rm
 
+evex128_rm :: Opcode -> Reg -> RM -> Code
+evex128_rm (I_66_0F38 op) r rm =
+    let
+        vx = evex r rm 0 2 0 1
+    in
+        vx <> b op <> modrm_sib_disp r rm
+
 ------------------
 get_r :: Reg -> Word8
 get_r (Xmm reg) = reg .&. 7
@@ -81,9 +91,13 @@ modrm_sib_disp reg (AbsMem addr) =
         mod = 0
         rm = 4
         modrm = (mod `shiftL` 6) .|. (r `shiftL` 3) .|. rm
+        base = 5
+        index = 4
+        ss = 0
+        sib = (ss `shiftL` 6) .|. (index `shiftL` 3) .|. base
         disp = int_as_four_bytes addr
     in
-        b modrm <> disp
+        b modrm <> b sib <> disp
 modrm_sib_disp reg (R reg') =
     let
         r = get_r reg
@@ -122,10 +136,9 @@ maybe_rex reg rm w =
             b rex
 
 vex :: Reg -> RM -> Word8 -> Word8 -> Word8 -> Word8 -> Code
-vex reg rm w' m_mmmm l pp =
+vex reg rm w m_mmmm l pp =
     let
         r = 1 - rex_r reg
-        w = 1 - w'
         x = 1 - rex_x rm
         b' = 1 - rex_b rm
         vvvv = 15
@@ -139,6 +152,23 @@ vex reg rm w' m_mmmm l pp =
             b 0xc4 <>
                 b ((r `shiftL` 7) .|. (x `shiftL` 6) .|. (b' `shiftL` 5) .|. m_mmmm) <>
                 b ((w `shiftL` 7) .|. (vvvv `shiftL` 3) .|. (l `shiftL` 2) .|. pp)
+
+evex :: Reg -> RM -> Word8 -> Word8 -> Word8 -> Word8 -> Code
+evex reg rm w mm ll pp =
+    let
+        r = 1-rex_r reg
+        x = 1-rex_x rm
+        b' = 1-rex_b rm
+        r' = 1
+        vvvv = 15
+        z = 0
+        v' = 0
+        aaa = 0
+    in
+        b 0x62 <>
+            b ((r `shiftL` 7) .|. (x `shiftL` 6) .|. (b' `shiftL` 5) .|. (r' `shiftL` 4) .|. mm) <>
+            b ((w `shiftL` 7) .|. (vvvv `shiftL` 3) .|. 4 .|. pp) <>
+            b ((z `shiftL` 7) .|. (ll `shiftL` 5) .|. (v' `shiftL` 3) .|. aaa)
 
 xmm_addr :: Reg -> Word8
 xmm_addr (Xmm n) = n

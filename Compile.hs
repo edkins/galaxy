@@ -101,7 +101,7 @@ find_or_emit_uniform n = do
             xreg <- fresh_gpr name
             yreg <- fresh_xmm name
             emit (old_oi mov_oi8 xreg n)
-            emit (vex128_rm vpbroadcastb_rm yreg (R xreg))
+            emit (evex128_rm evpbroadcastb_gpr_rm yreg (R xreg))
             return yreg
 
 compile_statement :: Statement -> Compilation ()
@@ -129,6 +129,19 @@ make_elf lit code =
     let
         code_start = fromIntegral (base_addr_for_literals + clength lit)
         entry_point = code_start
+ 
+        strings = "\0.shstrtab\0.rodata\0.text\0"
+        string_null = 0
+        string_shstrtab = string_null + 1
+        string_rodata = string_shstrtab + 10
+        string_text = string_rodata + 8
+
+        phnum = 2
+        shnum = 4
+        offset0 = 0x40 + fromIntegral phnum * 0x38
+        offset1 = offset0 + fromIntegral (clength lit)
+        offset_shstrtab = offset1 + fromIntegral (clength code)
+        shoff = offset_shstrtab + fromIntegral (length strings)
 
         ei_mag = b 0x7f <> b 0x45 <> b 0x4c <> b 0x46  -- magic number
         ei_class = b 2   -- 64-bit
@@ -142,21 +155,19 @@ make_elf lit code =
         e_version = dw 1
         e_entry = qw entry_point
         e_phoff = qw 0x40
-        e_shoff = qw 0
+        e_shoff = qw shoff
         e_flags = dw 0
         e_ehsize = wd 0x40
         e_phentsize = wd 0x38
-        phnum = 2
         e_phnum = wd phnum
         e_shentsize = wd 0x40
-        e_shnum = wd 0
-        e_shstrndx = wd 0
+        e_shnum = wd shnum
+        e_shstrndx = wd 1
 
         elf_header = e_ident <> e_type <> e_machine <> e_version <> e_entry <> e_phoff <> e_shoff <> e_flags <> e_ehsize <> e_phentsize <> e_phnum <> e_shentsize <> e_shnum <> e_shstrndx
 
         p0_type = dw 1    -- LOAD
         p0_flags = dw 4   -- r
-        offset0 = 0x40 + fromIntegral phnum * 0x38
         p0_offset = qw offset0
         p0_vaddr = qw $ fromIntegral base_addr_for_literals
         p0_paddr = qw 0
@@ -167,7 +178,6 @@ make_elf lit code =
         
         p1_type = dw 1
         p1_flags = dw 5   -- r+x
-        offset1 = offset0 + fromIntegral (clength lit)
         p1_offset = qw offset1
         p1_vaddr = qw code_start
         p1_paddr = qw 0
@@ -175,8 +185,58 @@ make_elf lit code =
         p1_memsz = p1_filesz
         p1_align = qw 1
         p1 = p1_type <> p1_flags <> p1_offset <> p1_vaddr <> p1_paddr <> p1_filesz <> p1_memsz <> p1_align
+
+        shstrtab = strbytes strings
+
+        sh0_name = dw string_null
+        sh0_type = dw 0  -- NULL
+        sh0_flags = qw 0
+        sh0_addr = qw 0
+        sh0_offset = qw 0
+        sh0_size = qw 0
+        sh0_link = dw 0
+        sh0_info = dw 0
+        sh0_addralign = qw 0
+        sh0_entsize = qw 0
+        sh0 = sh0_name <> sh0_type <> sh0_flags <> sh0_addr <> sh0_offset <> sh0_size <> sh0_link <> sh0_info <> sh0_addralign <> sh0_entsize
+
+        sh1_name = dw string_shstrtab
+        sh1_type = dw 3  -- STRTAB
+        sh1_flags = qw 0
+        sh1_addr = qw 0
+        sh1_offset = qw offset_shstrtab
+        sh1_size = qw $ fromIntegral $ length strings
+        sh1_link = dw 0
+        sh1_info = dw 0
+        sh1_addralign = qw 0
+        sh1_entsize = qw 0
+        sh1 = sh1_name <> sh1_type <> sh1_flags <> sh1_addr <> sh1_offset <> sh1_size <> sh1_link <> sh1_info <> sh1_addralign <> sh1_entsize
+
+        sh2_name = dw string_rodata
+        sh2_type = dw 1   -- PROGBITS
+        sh2_flags = qw 2  -- ALLOC
+        sh2_addr = p0_vaddr
+        sh2_offset = p0_offset
+        sh2_size = p0_filesz
+        sh2_link = dw 0
+        sh2_info = dw 0
+        sh2_addralign = qw 0x1000
+        sh2_entsize = qw 0
+        sh2 = sh2_name <> sh2_type <> sh2_flags <> sh2_addr <> sh2_offset <> sh2_size <> sh2_link <> sh2_info <> sh2_addralign <> sh2_entsize
+
+        sh3_name = dw string_text
+        sh3_type = dw 1   -- PROGBITS
+        sh3_flags = qw 6  -- ALLOC|EXECINSTR
+        sh3_addr = p1_vaddr
+        sh3_offset = p1_offset
+        sh3_size = p1_filesz
+        sh3_link = dw 0
+        sh3_info = dw 0
+        sh3_addralign = qw 1
+        sh3_entsize = qw 0
+        sh3 = sh3_name <> sh3_type <> sh3_flags <> sh3_addr <> sh3_offset <> sh3_size <> sh3_link <> sh3_info <> sh3_addralign <> sh3_entsize
     in
-        elf_header <> p0 <> p1 <> lit <> code
+        elf_header <> p0 <> p1 <> lit <> code <> shstrtab <> sh0 <> sh1 <> sh2 <> sh3
 
 compile :: [Statement] -> Elf
 compile ss =
