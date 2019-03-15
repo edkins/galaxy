@@ -3,7 +3,7 @@ module X86 where
 import Data.Bits ((.&.),(.|.),shiftL,shiftR)
 import Data.ByteString.Builder
 import Data.Monoid ((<>))
-import Data.Word (Word8)
+import Data.Word (Word8,Word16,Word32,Word64)
 
 data Code = Code Builder Int
 
@@ -25,6 +25,15 @@ paddb_rm = I_66_0F 0xfc
 ------------------
 b :: Word8 -> Code
 b w = Code (word8 w) 1
+
+wd :: Word16 -> Code
+wd w = Code (word16LE w) 2
+
+dw :: Word32 -> Code
+dw w = Code (word32LE w) 4
+
+qw :: Word64 -> Code
+qw w = Code (word64LE w) 8
 
 bytes :: [Word8] -> Code
 bytes [] = mempty
