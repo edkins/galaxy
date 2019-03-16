@@ -1,0 +1,196 @@
+Floating point instructions
+addpd, addps
+addsd, addss
+addsubpd, addsubps
+andpd, andps
+andnpd, andnps
+blendpd, blendps
+blendvpd, blendvps
+cmppd, cmpps
+cmpsd, cmpss
+comisd, comiss
+cvtpd2ps, cvtps2pd
+cvtsd2ss, cvtss2sd
+divpd, divps
+divsd, divss
+dppd, dpps
+extractps
+haddpd, haddps
+hsubpd, hsubps
+insertps
+maxpd, maxps
+maxsd, maxss
+minpd, minps
+minsd, minss
+movapd, movaps
+movntpd, movntps
+movsd, movss
+movupd, movups
+mulpd, mulps
+mulsd, mulss
+orpd, orps
+rcpps
+rcpss
+roundpd, roundps
+roundsd, roundss
+rsqrtps
+rsqrtss
+sqrtpd, sqrtps
+sqrtsd, sqrtss
+subpd, subps
+subsd, subss
+ucomisd, ucomiss
+unpckhpd, unpckhps
+unpcklpd, unpcklps
+vcvtph2ps
+vcvtps2ph
+vextractf*
+vfnmadd*
+vfnmsub*
+vinsertf*
+vperm2f128
+vpermilpd, vpermilps
+vpermd, vperms
+
+Floating point that might be useful for integer?
+movddup
+movhlps ("redundant with vpermilps")
+movhpd, movhps
+movlhps ("redundant with vpermilps")
+movlpd, movlps
+movmskpd, movmskps
+movshdup
+movsldup
+shufpd, shufps
+vtestpd, vtestps
+
+Floating point to integer conversions
+cvtdq2pd, cvtdq2ps
+cvtpd2dq, cvtps2dq
+cvtpd2pi, cvtps2pi
+cvtpi2pd, cvtpi2ps
+cvtsd2si, cvtss2si
+cvtsi2sd, cvtsi2ss
+cvttpd2dq, cvttps2dq
+cvttpd2pi, cvttps2pi
+cvttsd2si, cvttss2si
+
+
+Misc instructions
+aes*
+ldmxcsr, stmxcsr
+movdq2q, movq2dq
+
+Wide but not vector
+cmpxchg16b
+cqo
+pdep, pext
+
+Load
+lddqu
+movdqu
+movntdqa
+vgatherdpd, vgatherqpd, vgatherdps, vgatherqps
+vmaskmov
+vpgatherdd, vpgatherqd
+vpgatherdq, vpgatherqq
+vpmaskmovd
+
+Store
+maskmovdqu, maskmovq
+movntdq
+movnti
+movntq
+movq
+vmaskmov
+vpmaskmovd
+
+Non-lane arithmetic
+mpsadbw
+packsswb, packssdw
+packusdw, packuswb
+phaddw, phaddd
+phaddsw
+phminposuw
+phsubw, phsubd
+phsubsw
+pmaddubsw
+pmaddwd
+psadbw
+
+Non-lane
+palignr
+pmovmskb
+pmovsx
+pmovzx
+pshufb
+pshufd
+pshufhw
+pshuflw
+pshufw
+pslldq
+psrldq
+punpckhbw, punpckhwd, punpckhdq, punpckhqdq
+punpcklbw, punpcklwd, punpckldq, punpcklqdq
+vbroadcast
+vextracti*
+vinserti*
+vperm2i128
+vpermd
+vpermq
+
+Lane arithmetic
+pabsb, pabsw, pabsd, pabsq
+paddb, paddw, paddd, paddq
+paddsb, paddsw
+paddusb, paddusw
+pand
+pandn
+pavgb, pavgw
+pblendvb, pblendw
+pclmulqdq
+pmaxsb, pmaxsw, pmaxsd, pmaxsq
+pmaxub, pmaxuw
+pmaxud, pmaxuq
+pminsb, pminsw
+pminsd, pminsq
+pminub, pminuw
+pminud, pminuq
+pmuldq
+pmulhrsw
+pmulhuw
+pmulhw
+pmulld, pmullq
+pmullw
+pmuludq
+psignb, psignw, psignd
+psllw, pslld, psslq
+psraw, psrad, psraq
+psrlw, psrld, psrlq
+psubb, psubw, psubd, psubq
+psubsb, psubsw
+psubusb, psubusw
+pxor
+vpblendd
+vpsravd
+vpsrlvd, vpsrlvq
+
+Comparison and test
+pcmpeqb, pcmpeqw, pcmpeqd
+pcmpeqq
+pcmpgtb, pcmpgtw, pcmpgtd
+pcmpgtq
+ptest
+
+String
+pcmpestri
+pcmpestrm
+pcmpistri
+pcmpistrm
+
+Extract and insert
+pextrb, pextrd, pextrq
+pextrw
+pinstrb, pinstrd, pinsrq
+pinsrw
+

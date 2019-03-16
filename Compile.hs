@@ -1,6 +1,6 @@
 module Compile where
 
-import Parse (file,Statement(Assign),Expr(Literalu8,LiteralListu8,Var,MethodCall))
+import Parse (file,Statement(Assign,Exit),Expr(Literalu8,LiteralListu8,Var,MethodCall))
 import X86
 
 import Control.Monad.State (State,get,put,runState)
@@ -18,23 +18,25 @@ type Elf = Code
 
 type Compilation a = State (Env,Literals,Code) a
 
-base_addr_for_literals = 4096
+base_addr_for_literals = 0x08000000
+
+use_evex = False
 
 emit :: Code -> Compilation ()
 emit code' = do
     (env,lit,code) <- get
     put (env, lit, code <> code')
 
-padding :: Int -> Literals -> Code
-padding align lit =
-    case clength lit `mod` align of
+padding :: Int -> Int -> Code
+padding align codelen =
+    case codelen `mod` align of
         0 -> mempty
         n -> zeros (align-n)
 
 alloc_literal_aligned :: Int -> [Word8] -> Compilation Int
 alloc_literal_aligned align xs = do
     (env,lit,code) <- get
-    let lit' = lit <> padding align lit
+    let lit' = lit <> padding align (clength lit)
     put (env, lit' <> bytes xs, code)
     return (base_addr_for_literals + clength lit')
 
@@ -42,7 +44,7 @@ env_contains_reg :: Env -> Reg -> Bool
 env_contains_reg [] _ = False
 env_contains_reg ((x,r):e) reg = r==reg || env_contains_reg e reg
 
-env_contains_uniform :: Env -> Int -> Maybe Reg
+env_contains_uniform :: Env -> Word8 -> Maybe Reg
 env_contains_uniform [] _ = Nothing
 env_contains_uniform ((x,r):e) n = if x==show n then Just r else env_contains_uniform e n
 
@@ -79,7 +81,7 @@ env_lookup x = do
     (env,_,_) <- get
     return (lookup x env)
 
-env_lookup_uniform :: Int -> Compilation (Maybe Reg)
+env_lookup_uniform :: Word8 -> Compilation (Maybe Reg)
 env_lookup_uniform n = do
     (env,_,_) <- get
     return (env_contains_uniform env n)
@@ -91,18 +93,24 @@ find_or_fresh_xmm x = do
         Nothing -> fresh_xmm x
         Just r -> return r
 
-find_or_emit_uniform :: Int -> Compilation Reg
+find_or_emit_uniform :: Word8 -> Compilation Reg
 find_or_emit_uniform n = do
     mb <- env_lookup_uniform n
     case mb of
         Just r -> return r
         Nothing -> do
             let name = show n
-            xreg <- fresh_gpr name
-            yreg <- fresh_xmm name
-            emit (old_oi mov_oi8 xreg n)
-            emit (evex128_rm evpbroadcastb_gpr_rm yreg (R xreg))
-            return yreg
+            if use_evex then do
+                xreg <- fresh_gpr name
+                yreg <- fresh_xmm name
+                emit (old_oi mov_oi8 xreg (fromIntegral n))
+                emit (evex128_rm evpbroadcastb_gpr_rm yreg (R xreg))
+                return yreg
+            else do
+                addr <- alloc_literal_aligned 1 [n]
+                yreg <- fresh_xmm name
+                emit (vex128_rm vpbroadcastb_rm yreg (AbsMem addr))
+                return yreg
 
 compile_statement :: Statement -> Compilation ()
 compile_statement (Assign x (LiteralListu8 ls)) =
@@ -117,6 +125,10 @@ compile_statement (Assign x (MethodCall (Var y) "addwrap" [Literalu8 l])) = do
     xreg <- find_or_fresh_xmm x
     ureg <- find_or_emit_uniform (fromIntegral l)
     emit (sse_rm paddb_rm xreg (R ureg))
+compile_statement (Exit (Literalu8 l)) = do
+    emit (old_oi mov_oi64 _di (fromIntegral l))   -- Pad l to 8 bytes, move into rdi for first argument to syscall
+    emit (old_oi mov_oi64 _ax 60)                 -- syscall 60 is exit
+    emit (sse_zo syscall_zo)
 
 compile_with :: [Statement] -> Compilation ()
 compile_with [] = return ()
@@ -127,7 +139,8 @@ compile_with (s:ss) = do
 make_elf :: Literals -> Code -> Elf
 make_elf lit code =
     let
-        code_start = fromIntegral (base_addr_for_literals + clength lit)
+        lit' = lit <> padding 4096 (clength lit)
+        code_start = fromIntegral (base_addr_for_literals + clength lit')
         entry_point = code_start
  
         strings = "\0.shstrtab\0.rodata\0.text\0"
@@ -138,8 +151,10 @@ make_elf lit code =
 
         phnum = 2
         shnum = 4
-        offset0 = 0x40 + fromIntegral phnum * 0x38
-        offset1 = offset0 + fromIntegral (clength lit)
+        offset_padding = 0x40 + fromIntegral phnum * 0x38
+        pad = padding 4096 (fromIntegral offset_padding)
+        offset0 = offset_padding + fromIntegral (clength pad)
+        offset1 = offset0 + fromIntegral (clength lit')
         offset_shstrtab = offset1 + fromIntegral (clength code)
         shoff = offset_shstrtab + fromIntegral (length strings)
 
@@ -167,23 +182,23 @@ make_elf lit code =
         elf_header = e_ident <> e_type <> e_machine <> e_version <> e_entry <> e_phoff <> e_shoff <> e_flags <> e_ehsize <> e_phentsize <> e_phnum <> e_shentsize <> e_shnum <> e_shstrndx
 
         p0_type = dw 1    -- LOAD
-        p0_flags = dw 4   -- r
+        p0_flags = dw 5   -- r
         p0_offset = qw offset0
         p0_vaddr = qw $ fromIntegral base_addr_for_literals
-        p0_paddr = qw 0
-        p0_filesz = qw $ fromIntegral $ clength lit
+        p0_paddr = p0_vaddr
+        p0_filesz = qw $ fromIntegral $ clength lit'
         p0_memsz = p0_filesz
-        p0_align = qw 0x1000
+        p0_align = qw 4096
         p0 = p0_type <> p0_flags <> p0_offset <> p0_vaddr <> p0_paddr <> p0_filesz <> p0_memsz <> p0_align
         
         p1_type = dw 1
         p1_flags = dw 5   -- r+x
         p1_offset = qw offset1
         p1_vaddr = qw code_start
-        p1_paddr = qw 0
+        p1_paddr = p1_vaddr
         p1_filesz = qw $ fromIntegral $ clength code
         p1_memsz = p1_filesz
-        p1_align = qw 1
+        p1_align = qw 4096
         p1 = p1_type <> p1_flags <> p1_offset <> p1_vaddr <> p1_paddr <> p1_filesz <> p1_memsz <> p1_align
 
         shstrtab = strbytes strings
@@ -220,7 +235,7 @@ make_elf lit code =
         sh2_size = p0_filesz
         sh2_link = dw 0
         sh2_info = dw 0
-        sh2_addralign = qw 0x1000
+        sh2_addralign = qw 4096
         sh2_entsize = qw 0
         sh2 = sh2_name <> sh2_type <> sh2_flags <> sh2_addr <> sh2_offset <> sh2_size <> sh2_link <> sh2_info <> sh2_addralign <> sh2_entsize
 
@@ -232,11 +247,11 @@ make_elf lit code =
         sh3_size = p1_filesz
         sh3_link = dw 0
         sh3_info = dw 0
-        sh3_addralign = qw 1
+        sh3_addralign = qw 4096
         sh3_entsize = qw 0
         sh3 = sh3_name <> sh3_type <> sh3_flags <> sh3_addr <> sh3_offset <> sh3_size <> sh3_link <> sh3_info <> sh3_addralign <> sh3_entsize
     in
-        elf_header <> p0 <> p1 <> lit <> code <> shstrtab <> sh0 <> sh1 <> sh2 <> sh3
+        elf_header <> p0 <> p1 <> pad <> lit' <> code <> shstrtab <> sh0 <> sh1 <> sh2 <> sh3
 
 compile :: [Statement] -> Elf
 compile ss =

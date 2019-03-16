@@ -9,8 +9,8 @@ data Code = Code Builder Int
 
 data Reg = Xmm Word8 | Gpr Word8 deriving Eq
 data RM = R Reg | AbsMem Int | NoRM
-data Opcode = I_66_0F Word8 | I_66_0F38 Word8
-data OpcodeO = Old_OI Int Word8
+data Opcode = I_0F Word8 | I_66_0F Word8 | I_66_0F38 Word8
+data OpcodeO = Old_OI Word8 Int Word8
 
 instance Monoid Code where
     mempty = Code mempty 0
@@ -18,10 +18,25 @@ instance Monoid Code where
 
 ------------------
 movdqa_rm = I_66_0F 0x6f
-mov_oi8 = Old_OI 1 0xb0 -- 0xb0 thru 0xb7
-evpbroadcastb_gpr_rm = I_66_0F38 0x7a
+mov_oi8 = Old_OI 0 1 0xb0 -- 0xb0 thru 0xb7, 1-byte immediate
+mov_oi64 = Old_OI 1 8 0xb8 -- REX.W 0xb8 thru 0xbf, 8-byte immediate
 paddb_rm = I_66_0F 0xfc
+syscall_zo = I_0F 0x05
+vpbroadcastb_rm = I_66_0F38 0x78
 
+-- evex instructions
+evpbroadcastb_gpr_rm = I_66_0F38 0x7a
+
+
+------------------
+_ax = Gpr 0
+_cx = Gpr 1
+_dx = Gpr 2
+_bx = Gpr 3
+_sp = Gpr 4
+_bp = Gpr 5
+_si = Gpr 6
+_di = Gpr 7
 ------------------
 b :: Word8 -> Code
 b w = Code (word8 w) 1
@@ -55,10 +70,12 @@ code_as_builder (Code b _) = b
 sse_rm :: Opcode -> Reg -> RM -> Code
 sse_rm (I_66_0F op) r rm = b 0x66 <> maybe_rex r rm 0 <> b 0x0f <> b op <> modrm_sib_disp r rm
 
+sse_zo (I_0F op) = b 0x0f <> b op
+
 old_oi :: OpcodeO -> Reg -> Int -> Code
-old_oi (Old_OI imsize op) (Gpr reg) imval =
+old_oi (Old_OI w imsize op) (Gpr reg) imval =
     let
-        mrex = maybe_rex (Gpr reg) NoRM 0
+        mrex = maybe_rex (Gpr reg) NoRM w
         r = reg .&. 7
         op' = op + r
         imm = int_as_n_bytes imsize imval
