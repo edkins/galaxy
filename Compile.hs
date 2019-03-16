@@ -1,6 +1,6 @@
 module Compile where
 
-import Parse (file,Statement(Assign,Exit),Expr(Literalu8,LiteralListu8,Var,MethodCall))
+import Parse (file,Statement(Assign,Exit,Print),Expr(Literalu8,LiteralListu8,Var,MethodCall))
 import X86
 
 import Control.Monad.State (State,get,put,runState)
@@ -19,6 +19,8 @@ type Elf = Code
 type Compilation a = State (Env,Literals,Code) a
 
 base_addr_for_literals = 0x08000000
+stack_hi = 0x0a000000  -- it grows downwards
+stack_lo = 0x09000000
 
 use_evex = False
 
@@ -81,6 +83,13 @@ env_lookup x = do
     (env,_,_) <- get
     return (lookup x env)
 
+env_lookup_or_error :: String -> Compilation Reg
+env_lookup_or_error x = do
+    o <- env_lookup x
+    case o of
+        Nothing -> error ("Could not find variable " ++ x)
+        Just x -> return x
+
 env_lookup_uniform :: Word8 -> Compilation (Maybe Reg)
 env_lookup_uniform n = do
     (env,_,_) <- get
@@ -91,7 +100,16 @@ find_or_fresh_xmm x = do
     mb <- env_lookup x
     case mb of
         Nothing -> fresh_xmm x
-        Just r -> return r
+        Just (Xmm r) -> return (Xmm r)
+        Just _ -> error ("Found " ++ x ++ " but it wasn't an xmm regiser")
+
+find_xmm :: String -> Compilation Reg
+find_xmm x = do
+    mb <- env_lookup x
+    case mb of
+        Nothing -> error ("Could not find xmm register for " ++ x)
+        Just (Xmm r) -> return (Xmm r)
+        Just _ -> error ("Found " ++ x ++ " but it wasn't an xmm regiser")
 
 find_or_emit_uniform :: Word8 -> Compilation Reg
 find_or_emit_uniform n = do
@@ -104,12 +122,12 @@ find_or_emit_uniform n = do
                 xreg <- fresh_gpr name
                 yreg <- fresh_xmm name
                 emit (old_oi mov_oi8 xreg (fromIntegral n))
-                emit (evex128_rm evpbroadcastb_gpr_rm yreg (R xreg))
+                emit (evex256_rm evpbroadcastb_gpr_rm yreg (R xreg))
                 return yreg
             else do
                 addr <- alloc_literal_aligned 1 [n]
                 yreg <- fresh_xmm name
-                emit (vex128_rm vpbroadcastb_rm yreg (AbsMem addr))
+                emit (vex256_rm vpbroadcastb_rm yreg (AbsMem addr))
                 return yreg
 
 compile_statement :: Statement -> Compilation ()
@@ -118,17 +136,51 @@ compile_statement (Assign x (LiteralListu8 ls)) =
         do
             addr <- alloc_literal_aligned 16 ls
             xreg <- find_or_fresh_xmm x
-            emit (sse_rm movdqa_rm xreg (AbsMem addr))
+            emit (vex128_rm vmovdqa_rm xreg (AbsMem addr))
     else
         error "Expected exactly 16 bytes"
 compile_statement (Assign x (MethodCall (Var y) "addwrap" [Literalu8 l])) = do
     xreg <- find_or_fresh_xmm x
+    yreg <- find_xmm y
     ureg <- find_or_emit_uniform (fromIntegral l)
-    emit (sse_rm paddb_rm xreg (R ureg))
+    emit (vex128_rrm vpaddb_rrm xreg yreg (R ureg))
 compile_statement (Exit (Literalu8 l)) = do
     emit (old_oi mov_oi64 _di (fromIntegral l))   -- Pad l to 8 bytes, move into rdi for first argument to syscall
     emit (old_oi mov_oi64 _ax 60)                 -- syscall 60 is exit
     emit (sse_zo syscall_zo)
+compile_statement (Print (Var x)) = do
+    xreg <- env_lookup_or_error x
+    yreg <- fresh_xmm "_temp0"
+    zreg <- fresh_xmm "_temp1"
+    ureg15 <- find_or_emit_uniform 0x0f
+    ureg48 <- find_or_emit_uniform 48    -- difference between 0 and '0'
+    ureg39 <- find_or_emit_uniform 39    -- difference between '9'+1 and 'a'
+    ureg57 <- find_or_emit_uniform 57    -- '9'
+    return ()
+    emit (vex128_rrm vpand_rrm yreg xreg (R ureg15))  -- y[]u8 contains lower nibbles
+    emit (vex128_rmi_slash vpsrlw_rmi_slash zreg (R xreg) 4)
+    emit (vex128_rrm vpand_rrm zreg zreg (R ureg15))  -- z[]u8 contains upper nibbles
+    emit (vex256_rm vpmovzxbw_rm yreg (R yreg))       -- expand y[]u8 to y[]u16
+    emit (vex256_rm vpmovzxbw_rm zreg (R zreg))       -- expand z[]u8 to z[]u16
+    emit (vex256_rmi_slash vpsllw_rmi_slash yreg (R yreg) 8)       -- move lower nibbles into upper bytes
+    emit (vex256_rrm vpor_rrm yreg yreg (R zreg))
+    emit (vex256_rrm vpaddb_rrm yreg yreg (R ureg48)) -- turn 0 into '0', 9 into '9' and 10 into '9'+1
+    emit (vex256_rrm vpcmpgtb_rrm zreg yreg (R ureg57))   -- z[]bool holds (y[] > '9')
+    emit (vex256_rrm vpand_rrm zreg zreg (R ureg39))  -- z[]u8 holds (y[] > '9') ? 39 : 0
+    emit (vex256_rrm vpaddb_rrm yreg yreg (R zreg))   -- 0->'0', 9->'9', 10->'a', 15->'f'
+    emit (old_mi_slash sub_mi8_slash (R _sp) 32)
+    emit (vex256_mr vmovdqa_mr (RegMem _sp) yreg)
+    -- now do the write syscall
+    emit (old_oi mov_oi64 _di 1)    -- stdout
+    emit (old_rm mov_rm _si (R _sp))-- buf = rsp
+    emit (old_oi mov_oi64 _dx 32)   -- count = 32
+    emit (old_oi mov_oi64 _ax 1)    -- syscall 1 is write
+    emit (sse_zo syscall_zo)
+    emit (old_mi_slash add_mi8_slash (R _sp) 32)
+
+setup_stack :: Compilation ()
+setup_stack = do
+    emit (old_oi mov_oi64 _sp (fromIntegral stack_hi))  -- remember, it grows downwards
 
 compile_with :: [Statement] -> Compilation ()
 compile_with [] = return ()
@@ -149,7 +201,7 @@ make_elf lit code =
         string_rodata = string_shstrtab + 10
         string_text = string_rodata + 8
 
-        phnum = 2
+        phnum = 3
         shnum = 4
         offset_padding = 0x40 + fromIntegral phnum * 0x38
         pad = padding 4096 (fromIntegral offset_padding)
@@ -182,7 +234,7 @@ make_elf lit code =
         elf_header = e_ident <> e_type <> e_machine <> e_version <> e_entry <> e_phoff <> e_shoff <> e_flags <> e_ehsize <> e_phentsize <> e_phnum <> e_shentsize <> e_shnum <> e_shstrndx
 
         p0_type = dw 1    -- LOAD
-        p0_flags = dw 5   -- r
+        p0_flags = dw 4   -- r
         p0_offset = qw offset0
         p0_vaddr = qw $ fromIntegral base_addr_for_literals
         p0_paddr = p0_vaddr
@@ -191,7 +243,7 @@ make_elf lit code =
         p0_align = qw 4096
         p0 = p0_type <> p0_flags <> p0_offset <> p0_vaddr <> p0_paddr <> p0_filesz <> p0_memsz <> p0_align
         
-        p1_type = dw 1
+        p1_type = dw 1    -- LOAD
         p1_flags = dw 5   -- r+x
         p1_offset = qw offset1
         p1_vaddr = qw code_start
@@ -200,6 +252,16 @@ make_elf lit code =
         p1_memsz = p1_filesz
         p1_align = qw 4096
         p1 = p1_type <> p1_flags <> p1_offset <> p1_vaddr <> p1_paddr <> p1_filesz <> p1_memsz <> p1_align
+
+        p2_type = dw 1    -- LOAD
+        p2_flags = dw 6   -- r+w
+        p2_offset = qw 0
+        p2_vaddr = qw stack_lo
+        p2_paddr = p2_vaddr
+        p2_filesz = qw 0
+        p2_memsz = qw (stack_hi - stack_lo)
+        p2_align = qw 4096
+        p2 = p2_type <> p2_flags <> p2_offset <> p2_vaddr <> p2_paddr <> p2_filesz <> p2_memsz <> p2_align
 
         shstrtab = strbytes strings
 
@@ -251,11 +313,11 @@ make_elf lit code =
         sh3_entsize = qw 0
         sh3 = sh3_name <> sh3_type <> sh3_flags <> sh3_addr <> sh3_offset <> sh3_size <> sh3_link <> sh3_info <> sh3_addralign <> sh3_entsize
     in
-        elf_header <> p0 <> p1 <> pad <> lit' <> code <> shstrtab <> sh0 <> sh1 <> sh2 <> sh3
+        elf_header <> p0 <> p1 <> p2 <> pad <> lit' <> code <> shstrtab <> sh0 <> sh1 <> sh2 <> sh3
 
 compile :: [Statement] -> Elf
 compile ss =
-    let ((),(_,lit,code)) = runState (compile_with ss) ([],mempty,mempty)
+    let ((),(_,lit,code)) = runState (setup_stack >> compile_with ss) ([],mempty,mempty)
     in make_elf lit code
 
 compile_test :: IO ()

@@ -1,14 +1,14 @@
 module Parse where
 
 import Control.Applicative ((<|>))
-import Text.Parsec (try)
+import Text.Parsec (try,eof)
 import Text.Parsec.String (Parser,parseFromFile)
 import Text.Parsec.Char (letter,oneOf,char,string,digit)
 import Text.Parsec.Combinator (many1,skipMany1,optional,optionMaybe,sepBy)
 import Data.Word (Word8)
 
 data Expr = LiteralListu8 [Word8] | Literalu8 Word8 | Var String | MethodCall Expr String [Expr] deriving Show
-data Statement = Noop | Assign String Expr | Exit Expr deriving Show
+data Statement = Noop | Assign String Expr | Exit Expr | Print Expr deriving Show
 
 -------------------------
 
@@ -77,6 +77,11 @@ kw_exit = do
     string "exit"
     spaces
 
+kw_print :: Parser ()
+kw_print = do
+    string "print"
+    spaces
+
 -------------------------
 
 literal_list :: Parser Expr
@@ -132,13 +137,26 @@ assignment = do
 
 exit_statement :: Parser Statement
 exit_statement = do
-    kw_exit
+    try kw_exit
     e <- expr
+    newline
     return (Exit e)
 
-statement = assignment <|> exit_statement
+print_statement :: Parser Statement
+print_statement = do
+    try kw_print
+    e <- expr
+    newline
+    return (Print e)
 
-file = many1 statement
+statement :: Parser Statement
+statement = assignment <|> exit_statement <|> print_statement
+
+file :: Parser [Statement]
+file = do
+    result <- many1 statement
+    eof
+    return result
 
 -------------------------
 

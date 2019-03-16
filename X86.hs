@@ -7,22 +7,32 @@ import Data.Word (Word8,Word16,Word32,Word64)
 
 data Code = Code Builder Int
 
-data Reg = Xmm Word8 | Gpr Word8 deriving Eq
-data RM = R Reg | AbsMem Int | NoRM
-data Opcode = I_0F Word8 | I_66_0F Word8 | I_66_0F38 Word8
-data OpcodeO = Old_OI Word8 Int Word8
+data Reg = Xmm Word8 | Gpr Word8 | NoReg | Slash Word8 deriving Eq
+data RM = R Reg | AbsMem Int | RegMem Reg | NoRM
+data Opcode = I_0F Word8 | I_66_0F Word8 | I_66_0F38 Word8 | I_66_0F_slash Word8 Word8
+data OpcodeO = Old_OI Word8 Int Word8 | Old_MI_slash Word8 Int Word8 Word8 | Old_RM Word8 Word8
 
 instance Monoid Code where
     mempty = Code mempty 0
     mappend (Code b0 l0) (Code b1 l1) = Code (b0 <> b1) (l0 + l1)
 
 ------------------
-movdqa_rm = I_66_0F 0x6f
+add_mi8_slash = Old_MI_slash 1 1 0x83 0  -- REX.W 0x83/0, 1-byte immediate
 mov_oi8 = Old_OI 0 1 0xb0 -- 0xb0 thru 0xb7, 1-byte immediate
 mov_oi64 = Old_OI 1 8 0xb8 -- REX.W 0xb8 thru 0xbf, 8-byte immediate
-paddb_rm = I_66_0F 0xfc
+mov_rm = Old_RM 1 0x8b   -- REX.W 0x8b, modrm
+sub_mi8_slash = Old_MI_slash 1 1 0x83 5  -- REX.W 0x83/5, 1-byte immediate
 syscall_zo = I_0F 0x05
+vpaddb_rrm = I_66_0F 0xfc
+vpand_rrm = I_66_0F 0xdb
 vpbroadcastb_rm = I_66_0F38 0x78
+vpcmpgtb_rrm = I_66_0F 0x64
+vmovdqa_mr = I_66_0F 0x7f
+vmovdqa_rm = I_66_0F 0x6f
+vpmovzxbw_rm = I_66_0F38 0x30
+vpor_rrm = I_66_0F 0xeb
+vpsllw_rmi_slash = I_66_0F_slash 0x71 6
+vpsrlw_rmi_slash = I_66_0F_slash 0x71 2
 
 -- evex instructions
 evpbroadcastb_gpr_rm = I_66_0F38 0x7a
@@ -82,17 +92,75 @@ old_oi (Old_OI w imsize op) (Gpr reg) imval =
     in
         mrex <> b op' <> imm
 
-vex128_rm :: Opcode -> Reg -> RM -> Code
-vex128_rm (I_66_0F38 op) r rm =
+old_mi_slash :: OpcodeO -> RM -> Int -> Code
+old_mi_slash (Old_MI_slash w imsize op slash) rm imval =
     let
-        vx = vex r rm 0 2 0 1    --vex reg rm w' m_mmmm l pp
+        mrex = maybe_rex (Slash slash) rm w
+        imm = int_as_n_bytes imsize imval
     in
-        vx <> b op <> modrm_sib_disp r rm
+        mrex <> b op <> modrm_sib_disp (Slash slash) rm <> imm
 
-evex128_rm :: Opcode -> Reg -> RM -> Code
-evex128_rm (I_66_0F38 op) r rm =
+old_rm :: OpcodeO -> Reg -> RM -> Code
+old_rm (Old_RM w op) (Gpr reg) rm =
     let
-        vx = evex r rm 0 2 0 1
+        mrex = maybe_rex (Gpr reg) NoRM w
+    in
+        mrex <> b op <> modrm_sib_disp (Gpr reg) rm
+
+vex128_rm :: Opcode -> Reg -> RM -> Code
+vex128_rm op r rm = vex_rrm op 0 0 r NoReg rm mempty
+
+vex128_rmi_slash :: Opcode -> Reg -> RM -> Word8 -> Code
+vex128_rmi_slash op rv rm imval = vex_rrm op 0 0 (get_slash op) rv rm (b imval)
+
+vex128_rrm :: Opcode -> Reg -> Reg -> RM -> Code
+vex128_rrm op r rv rm = vex_rrm op 0 0 r rv rm mempty
+
+vex256_rrm :: Opcode -> Reg -> Reg -> RM -> Code
+vex256_rrm op r rv rm = vex_rrm op 0 1 r rv rm mempty
+
+vex256_rm :: Opcode -> Reg -> RM -> Code
+vex256_rm op r rm = vex_rrm op 0 1 r NoReg rm mempty
+
+vex256_mr :: Opcode -> RM -> Reg -> Code
+vex256_mr op rm r = vex_rrm op 0 1 r NoReg rm mempty
+
+vex256_rmi_slash :: Opcode -> Reg -> RM -> Word8 -> Code
+vex256_rmi_slash op rv rm imval = vex_rrm op 0 1 (get_slash op) rv rm (b imval)
+
+vex_rrm :: Opcode -> Word8 -> Word8 -> Reg -> Reg -> RM -> Code -> Code
+vex_rrm op w l r rv rm imm =
+    let
+        m_mmmm = vexop_mmmmm op
+        pp = vexop_pp op
+        o = vexop_op op
+        vx = vex r rv rm w m_mmmm l pp    --vex reg rm w m_mmmm l pp
+    in
+        vx <> b o <> modrm_sib_disp r rm <> imm
+
+vexop_mmmmm :: Opcode -> Word8
+vexop_mmmmm (I_66_0F38 _) = 2
+vexop_mmmmm (I_66_0F _) = 1
+vexop_mmmmm (I_66_0F_slash _ _) = 1
+
+vexop_pp :: Opcode -> Word8
+vexop_pp (I_66_0F38 _) = 1
+vexop_pp (I_66_0F _) = 1
+vexop_pp (I_66_0F_slash _ _) = 1
+
+vexop_op :: Opcode -> Word8
+vexop_op (I_66_0F38 op) = op
+vexop_op (I_66_0F op) = op
+vexop_op (I_66_0F_slash op _) = op
+
+get_slash :: Opcode -> Reg
+get_slash (I_66_0F_slash _ r) = Slash r
+
+------------------
+evex256_rm :: Opcode -> Reg -> RM -> Code
+evex256_rm (I_66_0F38 op) r rm =
+    let
+        vx = evex r rm 0 2 1 1
     in
         vx <> b op <> modrm_sib_disp r rm
 
@@ -100,6 +168,10 @@ evex128_rm (I_66_0F38 op) r rm =
 get_r :: Reg -> Word8
 get_r (Xmm reg) = reg .&. 7
 get_r (Gpr reg) = reg .&. 7
+get_r (Slash reg) = reg .&. 7
+
+get_vvvv (Xmm reg) = 15 - (reg .&. 15)
+get_vvvv NoReg = 15
 
 modrm_sib_disp :: Reg -> RM -> Code
 modrm_sib_disp reg (AbsMem addr) =
@@ -115,6 +187,18 @@ modrm_sib_disp reg (AbsMem addr) =
         disp = int_as_four_bytes addr
     in
         b modrm <> b sib <> disp
+modrm_sib_disp reg (RegMem (Gpr 4)) =   -- RSP
+    let
+        r = get_r reg
+        mod = 0
+        rm = 4
+        modrm = (mod `shiftL` 6) .|. (r `shiftL` 3) .|. rm
+        base = 4
+        index = 4
+        ss = 0
+        sib = (ss `shiftL` 6) .|. (index `shiftL` 3) .|. base
+    in
+        b modrm <> b sib
 modrm_sib_disp reg (R reg') =
     let
         r = get_r reg
@@ -127,16 +211,21 @@ modrm_sib_disp reg (R reg') =
 rex_r :: Reg -> Word8
 rex_r (Xmm n) = (n .&. 8) `shiftR` 3
 rex_r (Gpr n) = (n .&. 8) `shiftR` 3
+rex_r (Slash n) = 0
 
 rex_x :: RM -> Word8
 rex_x (R _) = 0
 rex_x (AbsMem _) = 0
+rex_x (RegMem (Gpr r))
+    | r < 8 = 0
 rex_x NoRM = 0
 
 rex_b :: RM -> Word8
 rex_b (R (Xmm n)) = (n .&. 8) `shiftR` 3
 rex_b (R (Gpr n)) = (n .&. 8) `shiftR` 3
 rex_b (AbsMem _) = 0
+rex_b (RegMem (Gpr r))
+    | r < 8 = 0
 rex_b NoRM = 0
 
 maybe_rex :: Reg -> RM -> Word8 -> Code
@@ -152,13 +241,13 @@ maybe_rex reg rm w =
         else
             b rex
 
-vex :: Reg -> RM -> Word8 -> Word8 -> Word8 -> Word8 -> Code
-vex reg rm w m_mmmm l pp =
+vex :: Reg -> Reg -> RM -> Word8 -> Word8 -> Word8 -> Word8 -> Code
+vex reg regv rm w m_mmmm l pp =
     let
         r = 1 - rex_r reg
         x = 1 - rex_x rm
         b' = 1 - rex_b rm
-        vvvv = 15
+        vvvv = get_vvvv regv
     in
         if m_mmmm == 1 && w == 1 && x == 1 && b' == 1 then
             -- two-byte vex
