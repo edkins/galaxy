@@ -15,7 +15,8 @@ import System.IO (withBinaryFile,IOMode (WriteMode))
 
 data EnvThing = ERX Reg | ERY Reg | ERQ Reg | Label Int deriving Eq
 data Width = WidthX | WidthY | WidthQ deriving (Eq,Show)
-type Env = [(String,EnvThing)]
+data EnvKey = EVar String | EUniform Word8 | ETemp deriving Eq
+type Env = [(EnvKey,EnvThing)]
 type Literals = Code
 type Elf = Code
 data Fixup = JmpFixup Int String deriving (Eq,Show)
@@ -41,7 +42,7 @@ emit code' = do
 emit_jmp :: String -> (Int -> Code) -> Compilation ()
 emit_jmp label codef = do
     (env,lit,code,fix) <- get
-    case lookup label env of
+    case lookup (EVar label) env of
         Just (Label a) -> put (env, lit, code <> codef a, fix)
         Nothing -> let code' = code <> codef 0 in
             put (env, lit, code', JmpFixup (clength code' - 4) label : fix)
@@ -65,13 +66,15 @@ env_contains_reg ((x,r):e) reg = r==ERX reg || r==ERY reg || r==ERQ reg || env_c
 
 env_contains_uniform :: Env -> Word8 -> Maybe Reg
 env_contains_uniform [] _ = Nothing
-env_contains_uniform ((x,ERY r):e) n = if x==show n then Just r else env_contains_uniform e n
+env_contains_uniform ((EUniform n',ERY r):e) n = if n'==n then Just r else env_contains_uniform e n
 env_contains_uniform ((x,_):e) n = env_contains_uniform e n
 
 fresh_xmm_from :: Word8 -> Env -> Reg
 fresh_xmm_from n env =
     if env_contains_reg env (Xmm n) then
         fresh_xmm_from (n+1) env
+    else if n >= 16 then
+        error "Run out of vector registers"
     else
         Xmm n
 
@@ -79,10 +82,12 @@ fresh_gpr_from :: Word8 -> Env -> Reg
 fresh_gpr_from n env =
     if env_contains_reg env (Gpr n) then
         fresh_gpr_from (n+1) env
+    else if n >= 16 then
+        error "Run out of general purpose registers"
     else
         Gpr n
 
-fresh_ymm :: String -> Compilation Reg
+fresh_ymm :: EnvKey -> Compilation Reg
 fresh_ymm x = do
     (env,lit,code,fix) <- get
     let result = fresh_xmm_from 0 env
@@ -93,13 +98,13 @@ fresh_gpr :: String -> Compilation Reg
 fresh_gpr x = do
     (env,lit,code,fix) <- get
     let result = fresh_gpr_from 0 env
-    put (env ++ [(x,ERQ result)],lit,code,fix)
+    put (env ++ [(EVar x,ERQ result)],lit,code,fix)
     return result
 
 env_lookup :: String -> Compilation (Maybe EnvThing)
 env_lookup x = do
     (env,_,_,_) <- get
-    return $ lookup x env
+    return $ lookup (EVar x) env
 
 env_lookup_uniform :: Word8 -> Compilation (Maybe Reg)
 env_lookup_uniform n = do
@@ -107,13 +112,14 @@ env_lookup_uniform n = do
     return (env_contains_uniform env n)
 
 fresh_temp_ymm :: Compilation Reg
-fresh_temp_ymm = fresh_ymm "(temp)"
+fresh_temp_ymm = fresh_ymm ETemp
+
 
 find_or_fresh_xmm :: String -> Compilation Reg
 find_or_fresh_xmm x = do
     mb <- env_lookup x
     case mb of
-        Nothing -> fresh_ymm x
+        Nothing -> fresh_ymm (EVar x)
         Just (ERX (Xmm r)) -> return (Xmm r)
         Just (ERY (Xmm r)) -> return (Xmm r)
         Just _ -> error ("Found " ++ x ++ " but it wasn't an xmm regiser")
@@ -145,28 +151,28 @@ find_or_emit_uniform n = do
             let name = show n
             if use_evex then do
                 xreg <- fresh_gpr name
-                yreg <- fresh_ymm name
+                yreg <- fresh_ymm (EVar name)
                 emit (old_oi mov_oi8 xreg (fromIntegral n))
                 emit (evex256_rm evpbroadcastb_gpr_rm yreg (R xreg))
                 return yreg
             else do
                 addr <- alloc_literal_aligned 1 [n]
-                yreg <- fresh_ymm name
+                yreg <- fresh_ymm (EVar name)
                 emit (vex256_rm vpbroadcastb_rm yreg (AbsMem addr))
                 return yreg
 
 args_to_env :: Word8 -> [String] -> Env
 args_to_env _ [] = []
-args_to_env n (x:xs) = (x, ERX (Xmm n)) : args_to_env (n+1) xs
+args_to_env n (x:xs) = (EVar x, ERX (Xmm n)) : args_to_env (n+1) xs
 
-is_global :: (String,EnvThing) -> Bool
+is_global :: (EnvKey,EnvThing) -> Bool
 is_global (_,Label _) = True
 is_global _ = False
 
 start_new_function :: String -> [String] -> Compilation ()
 start_new_function f args = do
     (env,lit,code,fix) <- get
-    let env' = args_to_env 0 args ++ [(f,Label (clength code))] ++ filter is_global env
+    let env' = args_to_env 0 args ++ [(EVar f,Label (clength code))] ++ filter is_global env
     put (env',lit,code,fix)
 
 thing_tweak_width :: Width -> EnvThing -> EnvThing
@@ -178,13 +184,23 @@ thing_tweak_width WidthY (ERY reg) = ERY reg
 env_tweak_width :: Width -> String -> Env -> Env
 env_tweak_width _ x [] = error ("env_tweak_width: variable " ++ x ++ " not found")
 env_tweak_width width x ((y,thing):env)
-    | x == y = (y,thing_tweak_width width thing):env
+    | EVar x == y = (y,thing_tweak_width width thing):env
     | otherwise = (y,thing) : env_tweak_width width x env
 
 tweak_width :: Width -> String -> Compilation ()
 tweak_width width x = do
     (env,lit,code,fix) <- get
     let env' = env_tweak_width width x env
+    put (env',lit,code,fix)
+
+is_not_temp :: (EnvKey,EnvThing) -> Bool
+is_not_temp (ETemp,_) = False
+is_not_temp _ = True
+
+discard_temps :: Compilation ()
+discard_temps = do
+    (env,lit,code,fix) <- get
+    let env' = filter is_not_temp env
     put (env',lit,code,fix)
 
 ---------------------------------
@@ -288,7 +304,7 @@ reserve_for_args (reg:regs) = do
     let (env',results') = (if env_contains_reg env reg
         then (env, results)
         else
-            (("_temp",ERY reg):env, reg:results))
+            ((ETemp,ERY reg):env, reg:results))
     put (env',lit,code,fix)
     return results'
 
@@ -302,6 +318,7 @@ compile_statement :: Statement -> Compilation ()
 compile_statement (Assign x e) = do
     xreg <- find_or_fresh_xmm x
     width <- compile_expr_to xreg e
+    discard_temps
     tweak_width width x
 compile_statement (Exit (Literalu8 l)) = do
     emit (old_oi mov_oi64 _di (fromIntegral l))   -- Pad l to 8 bytes, move into rdi for first argument to syscall
@@ -368,7 +385,7 @@ compile_with (s:ss) = do
 ---------------------------------
 insist_label :: Env -> String -> Int
 insist_label env x =
-    case lookup x env of
+    case lookup (EVar x) env of
         Just (Label n) -> n
         _ -> error ("Could not find label: " ++ x)
 
