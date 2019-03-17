@@ -1,22 +1,31 @@
 module Compile where
 
-import Parse (file,Statement(Assign,Exit,Print),Expr(Literalu8,LiteralListu8,Var,MethodCall))
+import Parse (file,Statement(Assign,Exit,Print,Call,Write,Fn,Return),Expr(Literalu8,LiteralListu8,Var,MethodCall))
 import X86
 
 import Control.Monad.State (State,get,put,runState)
 import Text.Parsec.String (parseFromFile)
 import Text.Parsec.Error (ParseError)
 import Data.ByteString.Builder
-import Data.ByteString.Lazy (unpack)
+import qualified Data.ByteString.Lazy as L
+import Data.List (sort)
 import Data.Word (Word8)
 import Data.Monoid ((<>))
 import System.IO (withBinaryFile,IOMode (WriteMode))
 
-type Env = [(String,Reg)]
+data EnvThing = ERX Reg | ERY Reg | ERQ Reg | Label Int deriving Eq
+data Width = WidthX | WidthY | WidthQ deriving (Eq,Show)
+type Env = [(String,EnvThing)]
 type Literals = Code
 type Elf = Code
+data Fixup = JmpFixup Int String deriving (Eq,Show)
+type Fixups = [Fixup]
 
-type Compilation a = State (Env,Literals,Code) a
+type Compilation a = State (Env,Literals,Code,Fixups) a
+
+-- Must compare address first
+instance Ord Fixup where
+    compare (JmpFixup a x) (JmpFixup b y) = compare (a,x) (b,y)
 
 base_addr_for_literals = 0x08000000
 stack_hi = 0x0a000000  -- it grows downwards
@@ -26,8 +35,16 @@ use_evex = False
 
 emit :: Code -> Compilation ()
 emit code' = do
-    (env,lit,code) <- get
-    put (env, lit, code <> code')
+    (env,lit,code,fix) <- get
+    put (env, lit, code <> code', fix)
+
+emit_jmp :: String -> (Int -> Code) -> Compilation ()
+emit_jmp label codef = do
+    (env,lit,code,fix) <- get
+    case lookup label env of
+        Just (Label a) -> put (env, lit, code <> codef a, fix)
+        Nothing -> let code' = code <> codef 0 in
+            put (env, lit, code', JmpFixup (clength code' - 4) label : fix)
 
 padding :: Int -> Int -> Code
 padding align codelen =
@@ -37,18 +54,19 @@ padding align codelen =
 
 alloc_literal_aligned :: Int -> [Word8] -> Compilation Int
 alloc_literal_aligned align xs = do
-    (env,lit,code) <- get
+    (env,lit,code,fix) <- get
     let lit' = lit <> padding align (clength lit)
-    put (env, lit' <> bytes xs, code)
+    put (env, lit' <> bytes xs, code, fix)
     return (base_addr_for_literals + clength lit')
 
 env_contains_reg :: Env -> Reg -> Bool
 env_contains_reg [] _ = False
-env_contains_reg ((x,r):e) reg = r==reg || env_contains_reg e reg
+env_contains_reg ((x,r):e) reg = r==ERX reg || r==ERY reg || r==ERQ reg || env_contains_reg e reg
 
 env_contains_uniform :: Env -> Word8 -> Maybe Reg
 env_contains_uniform [] _ = Nothing
-env_contains_uniform ((x,r):e) n = if x==show n then Just r else env_contains_uniform e n
+env_contains_uniform ((x,ERY r):e) n = if x==show n then Just r else env_contains_uniform e n
+env_contains_uniform ((x,_):e) n = env_contains_uniform e n
 
 fresh_xmm_from :: Word8 -> Env -> Reg
 fresh_xmm_from n env =
@@ -64,51 +82,58 @@ fresh_gpr_from n env =
     else
         Gpr n
 
-fresh_xmm :: String -> Compilation Reg
-fresh_xmm x = do
-    (env,lit,code) <- get
+fresh_ymm :: String -> Compilation Reg
+fresh_ymm x = do
+    (env,lit,code,fix) <- get
     let result = fresh_xmm_from 0 env
-    put (env ++ [(x,result)],lit,code)
+    put (env ++ [(x,ERY result)],lit,code,fix)
     return result
 
 fresh_gpr :: String -> Compilation Reg
 fresh_gpr x = do
-    (env,lit,code) <- get
+    (env,lit,code,fix) <- get
     let result = fresh_gpr_from 0 env
-    put (env ++ [(x,result)],lit,code)
+    put (env ++ [(x,ERQ result)],lit,code,fix)
     return result
 
-env_lookup :: String -> Compilation (Maybe Reg)
+env_lookup :: String -> Compilation (Maybe EnvThing)
 env_lookup x = do
-    (env,_,_) <- get
-    return (lookup x env)
-
-env_lookup_or_error :: String -> Compilation Reg
-env_lookup_or_error x = do
-    o <- env_lookup x
-    case o of
-        Nothing -> error ("Could not find variable " ++ x)
-        Just x -> return x
+    (env,_,_,_) <- get
+    return $ lookup x env
 
 env_lookup_uniform :: Word8 -> Compilation (Maybe Reg)
 env_lookup_uniform n = do
-    (env,_,_) <- get
+    (env,_,_,_) <- get
     return (env_contains_uniform env n)
+
+fresh_temp_ymm :: Compilation Reg
+fresh_temp_ymm = fresh_ymm "(temp)"
 
 find_or_fresh_xmm :: String -> Compilation Reg
 find_or_fresh_xmm x = do
     mb <- env_lookup x
     case mb of
-        Nothing -> fresh_xmm x
-        Just (Xmm r) -> return (Xmm r)
+        Nothing -> fresh_ymm x
+        Just (ERX (Xmm r)) -> return (Xmm r)
+        Just (ERY (Xmm r)) -> return (Xmm r)
         Just _ -> error ("Found " ++ x ++ " but it wasn't an xmm regiser")
 
-find_xmm :: String -> Compilation Reg
+find_xmm :: String -> Compilation (Reg,Width)
 find_xmm x = do
     mb <- env_lookup x
     case mb of
         Nothing -> error ("Could not find xmm register for " ++ x)
-        Just (Xmm r) -> return (Xmm r)
+        Just (ERX (Xmm r)) -> return (Xmm r,WidthX)
+        Just (ERY (Xmm r)) -> return (Xmm r,WidthY)
+        Just _ -> error ("Found " ++ x ++ " but it wasn't an xmm regiser")
+
+find_reg :: String -> Compilation (Reg,Width)
+find_reg x = do
+    mb <- env_lookup x
+    case mb of
+        Nothing -> error ("Could not find xmm register for " ++ x)
+        Just (ERX (Xmm r)) -> return (Xmm r, WidthX)
+        Just (ERY (Xmm r)) -> return (Xmm r, WidthY)
         Just _ -> error ("Found " ++ x ++ " but it wasn't an xmm regiser")
 
 find_or_emit_uniform :: Word8 -> Compilation Reg
@@ -120,43 +145,181 @@ find_or_emit_uniform n = do
             let name = show n
             if use_evex then do
                 xreg <- fresh_gpr name
-                yreg <- fresh_xmm name
+                yreg <- fresh_ymm name
                 emit (old_oi mov_oi8 xreg (fromIntegral n))
                 emit (evex256_rm evpbroadcastb_gpr_rm yreg (R xreg))
                 return yreg
             else do
                 addr <- alloc_literal_aligned 1 [n]
-                yreg <- fresh_xmm name
+                yreg <- fresh_ymm name
                 emit (vex256_rm vpbroadcastb_rm yreg (AbsMem addr))
                 return yreg
 
-compile_statement :: Statement -> Compilation ()
-compile_statement (Assign x (LiteralListu8 ls)) =
+args_to_env :: Word8 -> [String] -> Env
+args_to_env _ [] = []
+args_to_env n (x:xs) = (x, ERX (Xmm n)) : args_to_env (n+1) xs
+
+is_global :: (String,EnvThing) -> Bool
+is_global (_,Label _) = True
+is_global _ = False
+
+start_new_function :: String -> [String] -> Compilation ()
+start_new_function f args = do
+    (env,lit,code,fix) <- get
+    let env' = args_to_env 0 args ++ [(f,Label (clength code))] ++ filter is_global env
+    put (env',lit,code,fix)
+
+thing_tweak_width :: Width -> EnvThing -> EnvThing
+thing_tweak_width WidthX (ERX reg) = ERX reg
+thing_tweak_width WidthX (ERY reg) = ERX reg
+thing_tweak_width WidthY (ERX reg) = ERY reg
+thing_tweak_width WidthY (ERY reg) = ERY reg
+
+env_tweak_width :: Width -> String -> Env -> Env
+env_tweak_width _ x [] = error ("env_tweak_width: variable " ++ x ++ " not found")
+env_tweak_width width x ((y,thing):env)
+    | x == y = (y,thing_tweak_width width thing):env
+    | otherwise = (y,thing) : env_tweak_width width x env
+
+tweak_width :: Width -> String -> Compilation ()
+tweak_width width x = do
+    (env,lit,code,fix) <- get
+    let env' = env_tweak_width width x env
+    put (env',lit,code,fix)
+
+---------------------------------
+emit_binop :: Width -> String -> Reg -> Reg -> RM -> Compilation ()
+emit_binop WidthX "addb" x y z = emit (vex128_rrm vpaddb_rrm x y z)
+emit_binop WidthY "addb" x y z = emit (vex256_rrm vpaddb_rrm x y z)
+emit_binop WidthX "and" x y z = emit (vex128_rrm vpand_rrm x y z)
+emit_binop WidthY "and" x y z = emit (vex256_rrm vpand_rrm x y z)
+emit_binop WidthX "cmpgtb" x y z = emit (vex128_rrm vpcmpgtb_rrm x y z)
+emit_binop WidthY "cmpgtb" x y z = emit (vex256_rrm vpcmpgtb_rrm x y z)
+emit_binop WidthX "or" x y z = emit (vex128_rrm vpor_rrm x y z)
+emit_binop WidthY "or" x y z = emit (vex256_rrm vpor_rrm x y z)
+
+emit_shift :: Width -> String -> Reg -> RM -> Word8 -> Compilation ()
+emit_shift WidthX "sllw" x y im = emit (vex128_rmi_slash vpsllw_rmi_slash x y im)
+emit_shift WidthY "sllw" x y im = emit (vex256_rmi_slash vpsllw_rmi_slash x y im)
+emit_shift WidthX "srlw" x y im = emit (vex128_rmi_slash vpsrlw_rmi_slash x y im)
+emit_shift WidthY "srlw" x y im = emit (vex256_rmi_slash vpsrlw_rmi_slash x y im)
+
+emit_uop :: Width -> String -> Reg -> RM -> Compilation ()
+emit_uop WidthX "zxbw" x y = emit (vex128_rm vpmovzxbw_rm x y)
+emit_uop WidthY "zxbw" x y = emit (vex256_rm vpmovzxbw_rm x y)
+
+is_binop :: String -> Bool
+is_binop x = x `elem` ["addb","and","cmpgtb","or"]
+
+is_shift :: String -> Bool
+is_shift x = x `elem` ["sllw","srlw"]
+
+is_uop :: String -> Bool
+is_uop x = x `elem` ["zxbw"]
+
+get_constant_u8 :: Expr -> Word8
+get_constant_u8 (Literalu8 n) = n
+get_constant_u8 e = error ("Cannot interpret expression as constant u8: " ++ show e)
+
+compile_expr_to :: Reg -> Expr -> Compilation Width
+compile_expr_to xreg (Var y) = do
+    (yreg,yw) <- find_xmm y
+    if xreg == yreg then do
+        return yw
+    else if yw == WidthX then do
+        emit (vex128_rm vmovdqa_mr xreg (R yreg))
+        return WidthX
+    else if yw == WidthY then do
+        emit (vex256_rm vmovdqa_mr xreg (R yreg))
+        return WidthY
+    else
+        error ("Cannot move " ++ show yw)
+compile_expr_to xreg (LiteralListu8 ls) =
     if length ls == 16 then
         do
             addr <- alloc_literal_aligned 16 ls
-            xreg <- find_or_fresh_xmm x
             emit (vex128_rm vmovdqa_rm xreg (AbsMem addr))
+            return WidthX
     else
         error "Expected exactly 16 bytes"
-compile_statement (Assign x (MethodCall (Var y) "addwrap" [Literalu8 l])) = do
+compile_expr_to xreg (MethodCall ye "zxbw" []) = do
+    (yreg,yw) <- compile_expr Nothing ye
+    if yw == WidthX then do
+        emit (vex256_rm vpmovzxbw_rm xreg (R yreg))
+        return WidthY
+    else
+        error ("Cannot zxbw " ++ show yw)
+compile_expr_to xreg (MethodCall ye binop [ze])
+    | is_binop binop = do
+        (yreg,yw) <- compile_expr Nothing ye
+        (zreg,zw) <- compile_expr (Just yw) ze
+        if yw == WidthX && zw == WidthX then do
+            emit_binop WidthX binop xreg yreg (R zreg)
+            return WidthX
+        else if yw == WidthY && zw == WidthY then do
+            emit_binop WidthY binop xreg yreg (R zreg)
+            return WidthY
+        else
+            error ("Cannot " ++ show binop ++ " " ++ show yw ++ " " ++ show zw)
+    | is_shift binop = do
+        (yreg,yw) <- compile_expr Nothing ye
+        let imm = get_constant_u8 ze
+        emit_shift yw binop xreg (R yreg) imm
+        return yw
+
+compile_expr_to _ e = error ("currently unable to compile expression " ++ show e)
+
+compile_expr :: Maybe Width -> Expr -> Compilation (Reg,Width)
+compile_expr _ (Var x) = find_xmm x
+compile_expr (Just hint) (Literalu8 l) = do
+    reg <- find_or_emit_uniform (fromIntegral l)
+    return (reg, hint)
+compile_expr Nothing (Literalu8 _) = error "unknown width for literal"
+compile_expr _ e = do
+    xreg <- fresh_temp_ymm
+    width <- compile_expr_to xreg e
+    return (xreg,width)
+
+reserve_for_args :: [Reg] -> Compilation [Reg]
+reserve_for_args [] = return []
+reserve_for_args (reg:regs) = do
+    results <- reserve_for_args regs
+    (env,lit,code,fix) <- get
+    let (env',results') = (if env_contains_reg env reg
+        then (env, results)
+        else
+            (("_temp",ERY reg):env, reg:results))
+    put (env',lit,code,fix)
+    return results'
+
+compile_args :: [Expr] -> Compilation ()
+compile_args args = do
+    let indices = [0..fromIntegral (length args)-1]
+    reserved <- reserve_for_args $ map Xmm indices
+    mapM_ (\(arg,i) -> compile_expr_to (Xmm i) arg) $ zip args indices
+
+compile_statement :: Statement -> Compilation ()
+compile_statement (Assign x e) = do
     xreg <- find_or_fresh_xmm x
-    yreg <- find_xmm y
-    ureg <- find_or_emit_uniform (fromIntegral l)
-    emit (vex128_rrm vpaddb_rrm xreg yreg (R ureg))
+    width <- compile_expr_to xreg e
+    tweak_width width x
 compile_statement (Exit (Literalu8 l)) = do
     emit (old_oi mov_oi64 _di (fromIntegral l))   -- Pad l to 8 bytes, move into rdi for first argument to syscall
     emit (old_oi mov_oi64 _ax 60)                 -- syscall 60 is exit
     emit (sse_zo syscall_zo)
+compile_statement (Call f args) = do
+    compile_args args
+    emit_jmp f (old_i call_i32)
+compile_statement (Fn f args) = do
+    start_new_function f args
 compile_statement (Print (Var x)) = do
-    xreg <- env_lookup_or_error x
-    yreg <- fresh_xmm "_temp0"
-    zreg <- fresh_xmm "_temp1"
+    (xreg,WidthX) <- find_xmm x
+    yreg <- fresh_temp_ymm
+    zreg <- fresh_temp_ymm
     ureg15 <- find_or_emit_uniform 0x0f
     ureg48 <- find_or_emit_uniform 48    -- difference between 0 and '0'
     ureg39 <- find_or_emit_uniform 39    -- difference between '9'+1 and 'a'
     ureg57 <- find_or_emit_uniform 57    -- '9'
-    return ()
     emit (vex128_rrm vpand_rrm yreg xreg (R ureg15))  -- y[]u8 contains lower nibbles
     emit (vex128_rmi_slash vpsrlw_rmi_slash zreg (R xreg) 4)
     emit (vex128_rrm vpand_rrm zreg zreg (R ureg15))  -- z[]u8 contains upper nibbles
@@ -169,7 +332,7 @@ compile_statement (Print (Var x)) = do
     emit (vex256_rrm vpand_rrm zreg zreg (R ureg39))  -- z[]u8 holds (y[] > '9') ? 39 : 0
     emit (vex256_rrm vpaddb_rrm yreg yreg (R zreg))   -- 0->'0', 9->'9', 10->'a', 15->'f'
     emit (old_mi_slash sub_mi8_slash (R _sp) 32)
-    emit (vex256_mr vmovdqa_mr (RegMem _sp) yreg)
+    emit (vex256_mr vmovdqu_mr (RegMem _sp) yreg)
     -- now do the write syscall
     emit (old_oi mov_oi64 _di 1)    -- stdout
     emit (old_rm mov_rm _si (R _sp))-- buf = rsp
@@ -177,6 +340,20 @@ compile_statement (Print (Var x)) = do
     emit (old_oi mov_oi64 _ax 1)    -- syscall 1 is write
     emit (sse_zo syscall_zo)
     emit (old_mi_slash add_mi8_slash (R _sp) 32)
+compile_statement (Write (Var x)) = do
+    (xreg,WidthY) <- find_xmm x
+    emit (old_mi_slash sub_mi8_slash (R _sp) 32)
+    emit (vex256_mr vmovdqu_mr (RegMem _sp) xreg)
+    -- now do the write syscall
+    emit (old_oi mov_oi64 _di 1)    -- stdout
+    emit (old_rm mov_rm _si (R _sp))-- buf = rsp
+    emit (old_oi mov_oi64 _dx 32)   -- count = 32
+    emit (old_oi mov_oi64 _ax 1)    -- syscall 1 is write
+    emit (sse_zo syscall_zo)
+    emit (old_mi_slash add_mi8_slash (R _sp) 32)
+compile_statement Return = do
+    emit (old_zo ret_zo)
+compile_statement x = error ("currently unable to compile " ++ show x)
 
 setup_stack :: Compilation ()
 setup_stack = do
@@ -187,6 +364,35 @@ compile_with [] = return ()
 compile_with (s:ss) = do
     compile_statement s
     compile_with ss
+
+---------------------------------
+insist_label :: Env -> String -> Int
+insist_label env x =
+    case lookup x env of
+        Just (Label n) -> n
+        _ -> error ("Could not find label: " ++ x)
+
+perform_sorted_fixups :: Env -> Int -> Int -> L.ByteString -> [Fixup] -> Code
+perform_sorted_fixups _ _ remaining lb [] = Code (lazyByteString lb) remaining
+perform_sorted_fixups env pos remaining lb (JmpFixup addr x:fix) =
+    let
+        n = addr - pos
+        (lb0, lb1) = L.splitAt (fromIntegral n) lb
+        lb2 = L.drop 4 lb1
+        value = insist_label env x - (addr+4)
+        fixed = int_as_four_bytes value
+        fixed' = perform_sorted_fixups env (addr + 4) (remaining - n - 4) lb2 fix
+        code0 = Code (lazyByteString lb0) n
+    in
+        code0 <> fixed <> fixed'
+
+perform_fixups :: Env -> Code -> Fixups -> Code
+perform_fixups env code fixups =
+    let
+        lb = toLazyByteString $ code_as_builder code
+        len = clength code
+    in
+        perform_sorted_fixups env 0 len lb (sort fixups)
 
 make_elf :: Literals -> Code -> Elf
 make_elf lit code =
@@ -317,8 +523,11 @@ make_elf lit code =
 
 compile :: [Statement] -> Elf
 compile ss =
-    let ((),(_,lit,code)) = runState (setup_stack >> compile_with ss) ([],mempty,mempty)
-    in make_elf lit code
+    let
+        ((),(env,lit,code,fix)) = runState (setup_stack >> compile_with ss) ([],mempty,mempty,[])
+        code' = perform_fixups env code fix
+    in
+        make_elf lit code'
 
 compile_test :: IO ()
 compile_test = do

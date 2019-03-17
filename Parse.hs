@@ -8,7 +8,8 @@ import Text.Parsec.Combinator (many1,skipMany1,optional,optionMaybe,sepBy)
 import Data.Word (Word8)
 
 data Expr = LiteralListu8 [Word8] | Literalu8 Word8 | Var String | MethodCall Expr String [Expr] deriving Show
-data Statement = Noop | Assign String Expr | Exit Expr | Print Expr deriving Show
+data Statement = Noop | Assign String Expr | Exit Expr | Print Expr | Write Expr
+    | Call String [Expr] | Return | Fn String [String] deriving Show
 
 -------------------------
 
@@ -16,7 +17,7 @@ spaces :: Parser ()
 spaces = optional $ skipMany1 $ oneOf [' ','\t']
 
 newline :: Parser ()
-newline = skipMany1 $ oneOf ['\r','\n']
+newline = skipMany1 (oneOf ['\r','\n'] >> spaces)
 
 word :: Parser String
 word = do
@@ -30,12 +31,16 @@ number = do
     spaces
     return (read ds)
 
-number_u8 :: Parser Int
-number_u8 = do
+number_any :: Parser Expr
+number_any = do
     ds <- many1 digit
-    string "u8"
-    spaces
-    return (read ds) 
+    let n = read ds
+    (do
+        try $ string "u8"
+        spaces
+        return (Literalu8 n)) <|> (do
+        spaces
+        return (Literalu8 n))
 
 equals :: Parser ()
 equals = do
@@ -72,14 +77,34 @@ close_paren = do
     char ')'
     spaces
 
+kw_call :: Parser ()
+kw_call = do
+    string "call"
+    spaces
+
 kw_exit :: Parser ()
 kw_exit = do
     string "exit"
     spaces
 
+kw_fn :: Parser ()
+kw_fn = do
+    string "fn"
+    spaces
+
 kw_print :: Parser ()
 kw_print = do
     string "print"
+    spaces
+
+kw_return :: Parser ()
+kw_return = do
+    string "return"
+    spaces
+
+kw_write :: Parser ()
+kw_write = do
+    string "write"
     spaces
 
 -------------------------
@@ -96,13 +121,8 @@ word_expr = do
     x <- word
     return $ Var x
 
-u8_expr :: Parser Expr
-u8_expr = do
-    n <- number_u8
-    return $ Literalu8 (fromIntegral n)
-
 expr1 :: Parser Expr
-expr1 = literal_list <|> word_expr <|> u8_expr
+expr1 = literal_list <|> word_expr <|> number_any
 
 dot_method :: Expr -> Parser Expr
 dot_method e = do
@@ -135,6 +155,16 @@ assignment = do
     newline
     return $ Assign x e
 
+call_statement :: Parser Statement
+call_statement = do
+    try kw_call
+    f <- word
+    open_paren
+    args <- expr `sepBy` comma
+    close_paren
+    newline
+    return $ Call f args
+
 exit_statement :: Parser Statement
 exit_statement = do
     try kw_exit
@@ -149,8 +179,32 @@ print_statement = do
     newline
     return (Print e)
 
+write_statement :: Parser Statement
+write_statement = do
+    try kw_write
+    e <- expr
+    newline
+    return (Write e)
+
+return_statement :: Parser Statement
+return_statement = do
+    try kw_return
+    newline
+    return Return
+
+fn_statement :: Parser Statement
+fn_statement = do
+    try kw_fn
+    f <- word
+    open_paren
+    args <- word `sepBy` comma
+    close_paren
+    newline
+    return $ Fn f args
+
 statement :: Parser Statement
-statement = assignment <|> exit_statement <|> print_statement
+statement = assignment <|> exit_statement <|> print_statement <|> call_statement <|> write_statement <|> return_statement
+    <|> fn_statement
 
 file :: Parser [Statement]
 file = do
