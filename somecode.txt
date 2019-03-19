@@ -1,3 +1,45 @@
+#primitive operator persist(xs:#u8v) -> &u8v
+#inline operator broadcast(x:u8) -> u8v
+#    return u8v.garbage().insrb(x,0).broadcastb()
+
+# u8v - expands to u8x, u8y, u8z and possibly u8q
+# There are four technology levels: MMX, SSE, AVX, AVX512.
+#   MMX supports q size (64 bit), SSE supports x size (128 bit)
+#   AVX supports x and y size (128, 256 bit) and AVX512 supports x, y and z sizes (for most instructions).
+# (66) - indicates the (q) instruction is supported in MMX by omitting the 66 prefix
+# VEX - indicates the (x,y) instruction is only supported in AVX and AVX512
+# EVEX - indicates the (x,y,z) instruction is only supported in AVX512
+# VEX.256 - the (y) instruction is being described
+#
+# 66 - prefix byte (pp=1)
+# F3 - prefix byte (pp=2)
+# F2 - prefix byte (pp=3)
+# 0F - opcode leading byte     (mmmmm = 1)
+# 0F 38 - opcode leading bytes (mmmmm = 2)
+# 0F 3A - opcode leading bytes (mmmmm = 3)
+# other hexadecimal - main opcode byte
+# W0 - indicates the REX.W flag (or VEX/EVEX equivalent) must be 0
+# WIG - indicates the REX.W flag (or equivalent) is ignored for this instruction
+# /n - indicates the ModR/M byte must be present, and r must be set to n (instead of encoding a register as it usually does)
+#
+# & indicates the argument must be passed by reference (i.e. is in memory)
+# (&) indicates the argument may be passed by value or by reference
+# no ampersand indicates the argument must be passed by value (general purpose register for u8/u16/u32/u64,
+#   xmm register for u8x/u16x, ymm register for u8y/u16y, zmm register for u8z/u16z)
+# # indicates the value is known at compile time (and is typically encoded in the "immediate" portion of the instruction)
+
+primitive fn addb(xs:u8v, ys:(&)u8v) -> u8v = (66) 0F WIG FC
+primitive fn and(xs:u8v, ys:(&)u8v) -> u8v = (66) 0F WIG DB
+primitive fn broadcastb(x:&u8) -> u8v = VEX 66 0F 38 W0 78
+primitive fn broadcastb(xs:u8v) -> u8v = VEX 66 0F 38 W0 78
+primitive fn cmpgtb(xs:u8v, y:(&)u8v) -> u8v = (66) 0F WIG 64
+primitive fn insrb(xs:u8v, y:(&)u8, i:#u8) -> u8x = 66 0F 3A W0 20
+primitive fn or(xs:u8v, ys:(&)u8v) -> u8v = (66) 0F WIG EB
+primitive fn sllw(xs:(&)u16v, i:#u8) -> u16v = (66) 0F WIG 71 /6
+primitive fn srlw(xs:(&)u16v, i:#u8) -> u16v = (66) 0F WIG 71 /2
+primitive fn zxbw(xs:(&)u8x) -> u16y = VEX.256 66 0F 38 WIG 30
+primitive fn zxbw(xs:(&)u8y) -> u16z = EVEX.512 66 0F 38 WIG 30
+
 x = [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]u8
 x = x.addb(1u8)
 call myprint(x)

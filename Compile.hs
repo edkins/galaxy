@@ -1,6 +1,11 @@
 module Compile where
 
-import Parse (file,Statement(Assign,Exit,Print,Call,Write,Fn,Return),Expr(Literalu8,LiteralListu8,Var,MethodCall))
+import Parse (file,Statement(Assign,Exit,Print,Call,Write,Fn,Return,PrimitiveFn),Expr(Literalu8,LiteralListu8,Var,MethodCall))
+import Parse (AsmDef(asm_prefix,asm_vex,asm_op,asm_w,asm_mmmmm,asm_slash))
+import Parse (AsmVex(Vex,Vex128,Vex256,Evex,Evex128,Evex256,Evex512,Unspecified))
+import Parse (AsmPrefix(Optional66,Prefix66,PrefixF3,PrefixF2))
+import Parse (AsmM(M0F,M0F38,M0F3A), AsmW(W0,W1,WIG))
+import Parse (Type(ByReg,ByRM,ByMem,Known),PlainType(U8,U16,U8Q,U8X,U8Y,U8Z,U8V,U16Q,U16X,U16Y,U16Z,U16V))
 import X86
 
 import Control.Monad.State (State,get,put,runState)
@@ -13,14 +18,33 @@ import Data.Word (Word8)
 import Data.Monoid ((<>))
 import System.IO (withBinaryFile,IOMode (WriteMode))
 
-data EnvThing = ERX Reg | ERY Reg | ERQ Reg | Label Int deriving Eq
-data Width = WidthX | WidthY | WidthQ deriving (Eq,Show)
-data EnvKey = EVar String | EUniform Word8 | ETemp deriving Eq
+data InstrTech = Mmx | Sse | Avx | Avx2 deriving (Eq,Show)
+data InstrR = RConst Word8 | RArg Int | RRet | RNone | RDest deriving (Eq,Show)
+data InstrRM = RMArg Int | RMRet | RMNone | RMDest deriving (Eq,Show)
+data InstrV = VArg Int | VRet | V15 | NoV deriving (Eq,Show)
+data AsmInstr = AsmInstr {
+    instr_width :: Int,     -- 64, 128, 256 or 512
+    instr_tech :: InstrTech,-- which technology level & instruction encoding to use for this instruction
+    instr_pp :: Word8,      -- 0->none, 1->66, 2->F3, 3->F2
+    instr_mmmmm :: Word8,   -- 1->0F, 2->0F38, 3->0F3A
+    instr_w :: Word8,       -- 0 or 1. Currently set to 0 for "WIG" (W-ignored) instructions
+    instr_op :: Word8,      -- the single byte primary opcode
+    instr_args :: Int,      -- argument count.
+    instr_r :: InstrR,      -- set the ModR/M r value to this argument, return register or constant value. If RNone, no ModR/M byte.
+    instr_rm :: InstrRM,    -- set the ModR/M rm value to this argument or return register.
+    instr_vvvv :: InstrV,   -- set the VEX.vvvv value to this argument, or to 15 if not present
+    instr_imbytes :: Int    -- number of bytes in the immediate value, or 0 if there isn't one. Immediate is always written last.
+    } deriving (Eq,Show)
+data Primitive = Primitive [(String,Type)] Type AsmInstr deriving (Eq,Show)
+data EnvThing = ERX Reg | ERY Reg | ERQ Reg | Label Int | Prim [Primitive] deriving Eq
+data Width = WidthX | WidthY | WidthZ | WidthQ | WidthB deriving (Eq,Show)
+data EnvKey = EVar String | EUniform Word8 | ETemp deriving (Eq,Show)
 type Env = [(EnvKey,EnvThing)]
 type Literals = Code
 type Elf = Code
 data Fixup = JmpFixup Int String deriving (Eq,Show)
 type Fixups = [Fixup]
+data Result = ResR Reg | ResL Int deriving (Eq,Show)
 
 type Compilation a = State (Env,Literals,Code,Fixups) a
 
@@ -31,9 +55,101 @@ instance Ord Fixup where
 base_addr_for_literals = 0x08000000
 stack_hi = 0x0a000000  -- it grows downwards
 stack_lo = 0x09000000
-
 use_evex = False
 
+--------------------------------
+
+-- until I figure out how to correctly choose between different instruction technologies
+want_tech :: (InstrTech,Int) -> Bool
+want_tech (Avx,_) = True
+want_tech (_,_) = False
+
+asm_widths :: AsmDef -> [(InstrTech,Int)]
+asm_widths a =
+    let
+        mmx = (Mmx,64)
+        sse = (Sse,128)
+        x = (Avx,128)
+        y = (Avx,256)
+        x' = (Avx2,128)
+        y' = (Avx2,256)
+        z' = (Avx2,512)
+    in filter want_tech (if asm_prefix a == Optional66 then
+        if asm_vex a == Unspecified then
+            [mmx, sse, x, y, x', y', z']
+        else
+            error "(66) cannot be combined with VEX or EVEX"
+    else
+        case asm_vex a of
+            Unspecified -> [sse, x, y, x', y', z']
+            Vex -> [x, y, x', y', z']
+            Vex128 -> [x, x']
+            Vex256 -> [y, y']
+            Evex -> [x', y', z']
+            Evex128 -> [x']
+            Evex256 -> [y']
+            Evex512 -> [z'])
+
+translate_pp :: Int -> AsmPrefix -> Word8
+translate_pp 64 Optional66 = 0
+translate_pp _ Optional66 = 1
+translate_pp _ Prefix66 = 1
+translate_pp _ PrefixF3 = 2
+translate_pp _ PrefixF2 = 3
+
+translate_mmmmm :: AsmM -> Word8
+translate_mmmmm M0F = 1
+translate_mmmmm M0F38 = 2
+translate_mmmmm M0F3A = 3
+
+supports_vex :: AsmVex -> Bool
+supports_vex Unspecified = True
+supports_vex Vex = True
+supports_vex Vex128 = True
+supports_vex Vex256 = True
+supports_vex _ = False
+
+translate_imm :: [Type] -> (Int,[Type])
+translate_imm [] = (0,[])
+translate_imm xs =
+    case last xs of
+        Known U8 -> (1, init xs)
+        Known U16 -> (2, init xs)
+        Known t -> error ("Unknown immediate type: " ++ show t)
+        _ -> (0, xs)
+
+instr_r_rm_v :: Bool -> [Type] -> Maybe Word8 -> (InstrR,InstrRM,InstrV)
+instr_r_rm_v False [_] (Just n) = (RConst n, RMDest, NoV)     -- e.g. psslw(imm)
+instr_r_rm_v True  [_] (Just n) = (RConst n, RMArg 0, VRet)   -- e.g. vpsllw(imm)
+instr_r_rm_v False [_] Nothing = (RRet, RMArg 0, NoV)   -- e.g. pabsb
+instr_r_rm_v True  [_] Nothing = (RRet, RMArg 0, V15)   -- e.g. vpbroadcastb
+instr_r_rm_v False [ByReg _,ByRM _] Nothing = (RDest, RMArg 1, NoV)     -- e.g. paddb
+instr_r_rm_v True  [ByReg _,ByRM _] Nothing = (RRet, RMArg 1, VArg 0)   -- e.g. vpaddb
+
+translate_asm_width :: [Type] -> Type -> AsmDef -> (InstrTech,Int) -> AsmInstr
+translate_asm_width args ret a (tech,width) =
+    let
+        (imbytes, args') = translate_imm args
+        is_avx = tech /= Mmx && tech /= Sse
+        (r, rm, vvvv) = instr_r_rm_v is_avx args' (asm_slash a)
+    in AsmInstr {
+        instr_width = width,
+        instr_tech = tech,
+        instr_pp = translate_pp width (asm_prefix a),
+        instr_mmmmm = translate_mmmmm (asm_mmmmm a),
+        instr_w = (if asm_w a == W1 then 1 else 0),
+        instr_op = asm_op a,
+        instr_args = length args,
+        instr_r = r,
+        instr_rm = rm,
+        instr_vvvv = vvvv,
+        instr_imbytes = imbytes
+        }
+
+translate_asm :: [Type] -> Type -> AsmDef -> [AsmInstr]
+translate_asm args ret a = map (translate_asm_width args ret a) (asm_widths a)
+
+--------------------------------
 emit :: Code -> Compilation ()
 emit code' = do
     (env,lit,code,fix) <- get
@@ -167,6 +283,7 @@ args_to_env n (x:xs) = (EVar x, ERX (Xmm n)) : args_to_env (n+1) xs
 
 is_global :: (EnvKey,EnvThing) -> Bool
 is_global (_,Label _) = True
+is_global (_,Prim _) = True
 is_global _ = False
 
 start_new_function :: String -> [String] -> Compilation ()
@@ -203,6 +320,44 @@ discard_temps = do
     let env' = filter is_not_temp env
     put (env',lit,code,fix)
 
+env_replace :: EnvKey -> EnvThing -> Env -> Env
+env_replace x thing [] = error ("env_replace: variable " ++ show x ++ " not found")
+env_replace x thing ((y,t):env)
+    | x == y = ((x,thing):env)
+    | otherwise = (y,t):env_replace x thing env
+
+map_type :: (PlainType -> PlainType) -> Type -> Type
+map_type f (ByReg t) = ByReg (f t)
+map_type f (ByMem t) = ByMem (f t)
+map_type f (ByRM t) = ByRM (f t)
+map_type f (Known t) = Known (f t)
+
+specialize_plain :: Int -> PlainType -> PlainType
+specialize_plain 64 U8V = U8Q
+specialize_plain 128 U8V = U8X
+specialize_plain 256 U8V = U8Y
+specialize_plain 512 U8V = U8Z
+specialize_plain 64 U16V = U16Q
+specialize_plain 128 U16V = U16X
+specialize_plain 256 U16V = U16Y
+specialize_plain 512 U16V = U16Z
+specialize_plain _ t = t
+
+specialize_type :: AsmInstr -> Type -> Type
+specialize_type a = map_type (specialize_plain (instr_width a))
+
+specialize_args :: AsmInstr -> [(String,Type)] -> [(String,Type)]
+specialize_args a args = map (\(x,t) -> (x, specialize_type a t)) args
+
+define_primitive_function :: String -> [(String,Type)] -> Type -> [AsmInstr] -> Compilation ()
+define_primitive_function f args ret instrs = do
+    (env,lit,code,fix) <- get
+    let newprims = [Primitive (specialize_args a args) (specialize_type a ret) a | a <- instrs]
+    let env' = (case lookup (EVar f) env of
+            Nothing -> (EVar f, Prim newprims) : env
+            Just (Prim oldprims) -> env_replace (EVar f) (Prim (newprims++oldprims)) env)
+    put (env',lit,code,fix)
+
 ---------------------------------
 emit_binop :: Width -> String -> Reg -> Reg -> RM -> Compilation ()
 emit_binop WidthX "addb" x y z = emit (vex128_rrm vpaddb_rrm x y z)
@@ -237,6 +392,115 @@ get_constant_u8 :: Expr -> Word8
 get_constant_u8 (Literalu8 n) = n
 get_constant_u8 e = error ("Cannot interpret expression as constant u8: " ++ show e)
 
+width_of :: PlainType -> Width
+width_of U8Q = WidthQ
+width_of U16Q = WidthQ
+width_of U8X = WidthX
+width_of U16X = WidthX
+width_of U8Y = WidthY
+width_of U16Y = WidthY
+width_of U8Z = WidthZ
+width_of U16Z = WidthZ
+width_of x = error ("Why do you want the width of " ++ show x)
+
+unwrap_type :: Type -> PlainType
+unwrap_type (ByReg t) = t
+unwrap_type (ByMem t) = t
+unwrap_type (ByRM t) = t
+unwrap_type (Known t) = t
+
+arg_matches :: (Result,Width) -> (String,Type) -> Bool
+arg_matches (ResR _,w) (_,ByReg t) = width_of t == w
+arg_matches (ResR _,w) (_,ByRM t) = width_of t == w
+arg_matches (ResL _,WidthB) (_,Known U8) = True
+arg_matches (ResL _,WidthB) (_,ByReg U8X) = True   -- auto-broadcasts and auto-regifies
+arg_matches (ResL _,WidthB) (_,ByRM U8X) = True    --
+arg_matches (ResL _,WidthB) (_,ByReg U8Y) = True   --
+arg_matches (ResL _,WidthB) (_,ByRM U8Y) = True    --
+arg_matches _ _ = False
+
+find_or_emit_uniform_result :: Int -> Compilation Result
+find_or_emit_uniform_result n = do
+    r <- find_or_emit_uniform (fromIntegral n)
+    return (ResR r)
+
+-- assumes has already passed arg_matches
+autoconvert :: ((Result,Width),(String,Type)) -> Compilation Result
+autoconvert ((ResR r,_),(_,ByReg _)) = return (ResR r)
+autoconvert ((ResR r,_),(_,ByRM _)) = return (ResR r)
+autoconvert ((ResL n,WidthB),(_,Known U8)) = return (ResL n)
+autoconvert ((ResL n,WidthB),(_,ByReg U8X)) = find_or_emit_uniform_result n
+autoconvert ((ResL n,WidthB),(_,ByRM U8X)) = find_or_emit_uniform_result n
+autoconvert ((ResL n,WidthB),(_,ByReg U8Y)) = find_or_emit_uniform_result n
+autoconvert ((ResL n,WidthB),(_,ByRM U8Y)) = find_or_emit_uniform_result n
+
+prim_matches :: [(Result,Width)] -> Primitive -> Bool
+prim_matches ws (Primitive args' _ _) = length ws == length args' && and (zipWith arg_matches ws args')
+
+lookup_prim :: String -> [(Result,Width)] -> Compilation Primitive
+lookup_prim f ws = do
+    (env,_,_,_) <- get
+    case lookup (EVar f) env of
+        Just (Prim candidates) ->
+            case filter (prim_matches ws) candidates of
+                [x] -> return x
+                [] -> error ("No candidates matched for primitive fn " ++ f ++ show ws ++ ". Considered:\n" ++ concat (map (\(Primitive args _ _)->show args ++ "\n") candidates))
+                er -> error ("Multiple candidates matched for primitive fn " ++ f ++ show ws ++ ":\n" ++ concat (map (\(Primitive args _ a)->show args ++ " " ++ show (instr_tech a) ++ "\n") er))
+        Nothing -> error ("Could not find primitive fn " ++ f ++ " in " ++ show (map fst env))
+
+vex_width_code :: Int -> Word8
+vex_width_code 128 = 0
+vex_width_code 256 = 1
+vex_width_code 512 = 2
+
+insist_reg :: Result -> Reg
+insist_reg (ResR r) = r
+
+insist_rm :: Result -> RM
+insist_rm (ResR r) = R r
+
+insist_lit :: Result -> Int
+insist_lit (ResL n) = n
+
+lookup_instr_r :: InstrR -> [Result] -> Reg -> Reg
+lookup_instr_r (RConst n) _ _ = Slash n
+lookup_instr_r (RArg i) args _ = insist_reg (args !! i)
+lookup_instr_r RRet _ ret = ret
+lookup_instr_r RNone _ _ = NoReg
+lookup_instr_r RDest args _ = insist_reg (args !! 0)
+
+lookup_instr_rm :: InstrRM -> [Result] -> Reg -> RM
+lookup_instr_rm (RMArg i) args _ = insist_rm (args !! i)
+lookup_instr_rm RMRet _ ret = R ret
+lookup_instr_rm RMNone _ _ = NoRM
+lookup_instr_rm RMDest args _ = insist_rm (args !! 0)
+
+lookup_instr_v :: InstrV -> [Result] -> Reg -> Reg
+lookup_instr_v (VArg i) args _ = insist_reg (args !! i)
+lookup_instr_v VRet _ ret = ret
+lookup_instr_v V15 _ ret = NoReg
+
+lookup_instr_imm :: Int -> [Result] -> Code
+lookup_instr_imm 0 _ = mempty
+lookup_instr_imm imbytes args = int_as_n_bytes imbytes $ insist_lit $ last args
+
+emit_prim :: AsmInstr -> [Result] -> Reg -> Compilation ()
+emit_prim a args ret =
+    -- vex_misc w pp m_mmmm l op r rv rm imm
+    if instr_tech a == Avx then
+        emit (vex_misc
+            (instr_w a)
+            (instr_pp a)
+            (instr_mmmmm a)
+            (vex_width_code $ instr_width a)
+            (instr_op a)
+            (lookup_instr_r (instr_r a) args ret)
+            (lookup_instr_v (instr_vvvv a) args ret)
+            (lookup_instr_rm (instr_rm a) args ret)
+            (lookup_instr_imm (instr_imbytes a) args))
+    else
+        error ("Not currently encoding technology " ++ show (instr_tech a))
+
 compile_expr_to :: Reg -> Expr -> Compilation Width
 compile_expr_to xreg (Var y) = do
     (yreg,yw) <- find_xmm y
@@ -258,7 +522,15 @@ compile_expr_to xreg (LiteralListu8 ls) =
             return WidthX
     else
         error "Expected exactly 16 bytes"
-compile_expr_to xreg (MethodCall ye "zxbw" []) = do
+
+compile_expr_to xreg (MethodCall ye f arges) = do
+    args <- mapM (compile_expr Nothing) (ye:arges)
+    Primitive formals rt asm <- lookup_prim f args
+    ress <- mapM autoconvert (zip args formals)
+    emit_prim asm ress xreg
+    return $ width_of $ unwrap_type rt
+
+{-compile_expr_to xreg (MethodCall ye "zxbw" []) = do
     (yreg,yw) <- compile_expr Nothing ye
     if yw == WidthX then do
         emit (vex256_rm vpmovzxbw_rm xreg (R yreg))
@@ -282,19 +554,21 @@ compile_expr_to xreg (MethodCall ye binop [ze])
         let imm = get_constant_u8 ze
         emit_shift yw binop xreg (R yreg) imm
         return yw
-
+-}
 compile_expr_to _ e = error ("currently unable to compile expression " ++ show e)
 
-compile_expr :: Maybe Width -> Expr -> Compilation (Reg,Width)
-compile_expr _ (Var x) = find_xmm x
+compile_expr :: Maybe Width -> Expr -> Compilation (Result,Width)
+compile_expr _ (Var x) = do
+    (r,w) <- find_xmm x
+    return (ResR r,w)
 compile_expr (Just hint) (Literalu8 l) = do
     reg <- find_or_emit_uniform (fromIntegral l)
-    return (reg, hint)
-compile_expr Nothing (Literalu8 _) = error "unknown width for literal"
+    return (ResR reg, hint)
+compile_expr Nothing (Literalu8 n) = return (ResL (fromIntegral n),WidthB)
 compile_expr _ e = do
     xreg <- fresh_temp_ymm
     width <- compile_expr_to xreg e
-    return (xreg,width)
+    return (ResR xreg,width)
 
 reserve_for_args :: [Reg] -> Compilation [Reg]
 reserve_for_args [] = return []
@@ -370,6 +644,10 @@ compile_statement (Write (Var x)) = do
     emit (old_mi_slash add_mi8_slash (R _sp) 32)
 compile_statement Return = do
     emit (old_zo ret_zo)
+compile_statement (PrimitiveFn f args ret asm) = do
+    let argtypes = map snd args
+    let instrs = translate_asm argtypes ret asm
+    define_primitive_function f args ret instrs
 compile_statement x = error ("currently unable to compile " ++ show x)
 
 setup_stack :: Compilation ()

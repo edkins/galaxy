@@ -7,8 +7,8 @@ import Data.Word (Word8,Word16,Word32,Word64)
 
 data Code = Code Builder Int
 
-data Reg = Xmm Word8 | Gpr Word8 | NoReg | Slash Word8 deriving Eq
-data RM = R Reg | AbsMem Int | RegMem Reg | NoRM
+data Reg = Xmm Word8 | Gpr Word8 | NoReg | Slash Word8 deriving (Eq,Show)
+data RM = R Reg | AbsMem Int | RegMem Reg | NoRM deriving Eq
 data Opcode = I_0F Word8 | I_66_0F Word8 | I_F3_0F Word8 | I_66_0F38 Word8 | I_66_0F_slash Word8 Word8
 data OpcodeO = Old_OI Word8 Int Word8 | Old_MI_slash Word8 Int Word8 Word8 | Old_RM Word8 Word8
     | Old_I Word8 Int Word8 | Old_ZO Word8 Word8
@@ -158,6 +158,15 @@ vex_rrm op w l r rv rm imm =
         vx = vex r rv rm w m_mmmm l pp    --vex reg rm w m_mmmm l pp
     in
         vx <> b o <> modrm_sib_disp r rm <> imm
+
+vex_misc :: Word8 -> Word8 -> Word8 -> Word8 -> Word8 -> Reg -> Reg -> RM -> Code -> Code
+vex_misc w pp m_mmmm l op r rv rm imm =
+    let
+        vx = vex r rv rm w m_mmmm l pp    --vex reg rm w m_mmmm l pp
+    in if r == NoReg && rm == NoRM then
+        vx <> b op <> imm
+    else
+        vx <> b op <> modrm_sib_disp r rm <> imm
 
 vexop_mmmmm :: Opcode -> Word8
 vexop_mmmmm (I_66_0F38 _) = 2
