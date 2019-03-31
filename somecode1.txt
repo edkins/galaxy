@@ -28,48 +28,32 @@
 #   xmm register for u8x/u16x, ymm register for u8y/u16y, zmm register for u8z/u16z)
 # # indicates the value is known at compile time (and is typically encoded in the "immediate" portion of the instruction)
 
-# Vector instructions
 primitive fn addb(xs:u8v, ys:(&)u8v) -> u8v = (66) 0F WIG FC
 primitive fn and(xs:u8v, ys:(&)u8v) -> u8v = (66) 0F WIG DB
-primitive fn andn(xs:u8v, ys:(&)u8v) -> u8v = (66) 0F WIG DF
 primitive fn broadcastb(x:&u8) -> u8v = VEX 66 0F 38 W0 78
 primitive fn broadcastb(xs:u8v) -> u8v = VEX 66 0F 38 W0 78
 primitive fn cmpgtb(xs:u8v, y:(&)u8v) -> u8v = (66) 0F WIG 64
 primitive fn insrb(xs:u8v, y:(&)u8, i:#u8) -> u8x = 66 0F 3A W0 20
-primitive fn movdqu(xs:(&)u8v) -> u8v = F3 0F WIG 6F incidental
-primitive fn movdqu_mr(xs:u8v) -> &u8v = MR F3 0F WIG 7F incidental
 primitive fn or(xs:u8v, ys:(&)u8v) -> u8v = (66) 0F WIG EB
 primitive fn sllw(xs:(&)u16v, i:#u8) -> u16v = (66) 0F WIG 71 /6
 primitive fn srlw(xs:(&)u16v, i:#u8) -> u16v = (66) 0F WIG 71 /2
 primitive fn zxbw(xs:(&)u8x) -> u16y = VEX.256 66 0F 38 WIG 30
 primitive fn zxbw(xs:(&)u8y) -> u16z = EVEX.512 66 0F 38 WIG 30
 
-# Scalar instructions
-primitive fn addq(x:(&)u64, i:#i8) -> (&)u64 = W1 83 /0
-primitive fn cmp(x:(&)u64, y:u64) -> void = MR W1 39 incidental
-primitive fn jbe(rel:#i32) -> void = 0F WIG 86 incidental
-primitive fn jmp(rel:#i32) -> doesnotreturn = WIG E9 incidental
-primitive fn lea(x:&u64) -> u64 = W1 8D incidental
-primitive fn mov(x:(&)u64) -> u64 = W1 8B incidental
-primitive fn mov(x:#u64) -> u64 = W1 B8 +r incidental
-primitive fn subq(x:(&)u64, i:#i32) -> (&)u64 = W1 81 /5 incidental
+syscall fn read(fd:u64, buf:&mut[u8;count], count:u64) -> u64 = 0
 
-# Syscalls
-syscall fn read(fd:u64, buf:&uninitialized[u8;count], count:u64) -> u64, [u8;returnval]@buf = 0
-syscall fn write(fd:u64, buf:&[u8;count], count:u64) -> u64 = 1
-syscall fn exit(error_code:u64) -> doesnotreturn = 60
+x = [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]u8
+x = x.addb(1u8)
+call myprint(x)
+exit 0u8
 
-buf = &uninitialized[u8;1024u64]
-len,buf = 0u64.read(buf, 1024u64)
-i = 0u64
-loop
-    x = buf[i..+32]
-    y = x.cmpgtb(96).andn(x.cmpgtb(64))
-    x = x.addb(y.and(32))
-    buf[i..+32] = x
-    i = i.addq(32i8)
-    break if i >= len
-endloop
-written = 1u64.write(buf, len)
-0u64.exit()
+fn myprint(x)
+    y = x.and(15).zxbw().sllw(8)
+    z = x.srlw(4).and(15).zxbw()
+    y = y.or(z).addb(48)
+    z = y.cmpgtb(57)
+    z = z.and(39)
+    y = y.addb(z)
+    write y
+    return
 

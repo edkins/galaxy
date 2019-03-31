@@ -1,0 +1,4 @@
+avoid emitting instructions that don't go through emit_prim
+create AST annotated with types
+store type with environment things
+

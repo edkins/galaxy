@@ -4,32 +4,43 @@ import Control.Applicative ((<|>))
 import Text.Parsec (try,eof)
 import Text.Parsec.String (Parser,parseFromFile)
 import Text.Parsec.Char (letter,oneOf,char,string,digit,anyChar)
-import Text.Parsec.Combinator (many1,skipMany1,optional,optionMaybe,sepBy,notFollowedBy,optional,manyTill)
-import Data.Word (Word8)
+import Text.Parsec.Combinator (many1,skipMany1,option,optional,optionMaybe,sepBy,notFollowedBy,optional,manyTill)
+import Data.Word (Word8,Word64)
+import Data.Int (Int8)
 
-data Expr = LiteralListu8 [Word8] | Literalu8 Word8 | Var String | MethodCall Expr String [Expr] deriving Show
-data PlainType = U8 | U8Q | U8X | U8Y | U8Z | U8V | U16 | U16Q | U16X | U16Y | U16Z | U16V deriving (Eq,Show)
-data Type = ByReg PlainType | ByMem PlainType | ByRM PlainType | Known PlainType deriving (Eq,Show)
+data Expr = LiteralListu8 [Word8] | Literalu8 Word8 | Literali8 Int8 | Literalu64 Word64 | Var String | MethodCall Expr String [Expr]
+    | Uninit PlainType | MutParam Expr | Slice Expr Expr Expr | Le Expr Expr deriving (Eq,Show)
+data PlainType = U8 | U8Q | U8X | U8Y | U8Z | U8V | U16 | U16Q | U16X | U16Y | U16Z | U16V | I32 | U64
+    | I8
+    | Array PlainType Expr deriving (Eq,Show)
+data Type = ByReg PlainType | ByMem PlainType | ByRM PlainType | Known PlainType
+    | Uninitialized PlainType | Mut Type Type | Switch Type Type | DoesNotReturn | Void deriving (Eq,Show)
 data AsmVex = Vex | Vex128 | Vex256 | Evex | Evex128 | Evex256 | Evex512 | Unspecified deriving (Eq,Show)
-data AsmPrefix = Optional66 | Prefix66 | PrefixF3 | PrefixF2 deriving (Eq,Show)
-data AsmM = M0F | M0F38 | M0F3A deriving (Eq,Show)
+data AsmPrefix = Optional66 | Prefix66 | PrefixF3 | PrefixF2 | NoPrefix deriving (Eq,Show)
+data AsmM = M0F | M0F38 | M0F3A | NoM deriving (Eq,Show)
 data AsmW = W0 | W1 | WIG deriving (Eq,Show)
 data AsmDef = AsmDef {
+    asm_mr :: Bool,
     asm_vex :: AsmVex,
     asm_prefix :: AsmPrefix,
     asm_mmmmm :: AsmM,
     asm_w :: AsmW,
     asm_op :: Word8,
+    asm_plusr :: Bool,
     asm_slash :: Maybe Word8
     } deriving Show
-data Statement = Noop | Assign String Expr | Exit Expr | Print Expr | Write Expr
-    | Call String [Expr] | Return | Fn String [String] | PrimitiveFn String [(String,Type)] Type AsmDef deriving Show
+data Statement = Noop | Assign [Expr] Expr | Exit Expr | Print Expr | Write Expr
+    | PlainExpr Expr | Return | Fn String [String] | PrimitiveFn String [(String,Type)] Type AsmDef Bool
+    | SyscallFn String [(String,Type)] [(String,Type)] Int | Loop [Statement] | BreakIf Expr deriving Show
 
 -------------------------
+letter_underscore :: Parser Char
+letter_underscore = letter <|> char '_'
+
 kw :: String -> Parser ()
 kw s = do
     string s
-    notFollowedBy letter
+    notFollowedBy letter_underscore
     spaces
 
 trykw :: String -> a -> Parser a
@@ -53,7 +64,7 @@ newline = skipMany1 one_newline
 
 word :: Parser String
 word = do
-    result <- many1 letter
+    result <- many1 letter_underscore
     spaces
     return result
 
@@ -66,13 +77,18 @@ number = do
 number_any :: Parser Expr
 number_any = do
     ds <- many1 digit
-    let n = read ds
     (do
         try $ string "u8"
         spaces
-        return (Literalu8 n)) <|> (do
+        return (Literalu8 (read ds))) <|> (do
+        try $ string "u64"
         spaces
-        return (Literalu8 n))
+        return (Literalu64 (read ds))) <|> (do
+        try $ string "i8"
+        spaces
+        return (Literali8 (read ds))) <|> (do
+        spaces
+        return (Literalu8 (read ds)))
 
 equals :: Parser ()
 equals = do
@@ -96,7 +112,7 @@ comma = do
 
 dot :: Parser ()
 dot = do
-    char '.'
+    try (char '.' >> notFollowedBy (char '.'))
     spaces
 
 open_paren :: Parser ()
@@ -137,10 +153,25 @@ kw_print = kw "print"
 kw_return :: Parser ()
 kw_return = kw "return"
 
+kw_syscall :: Parser ()
+kw_syscall = kw "syscall"
+
 kw_write :: Parser ()
 kw_write = kw "write"
 
 -------------------------
+array_type :: Parser PlainType
+array_type = do
+    char '['
+    spaces
+    t <- plain_type
+    char ';'
+    spaces
+    e <- expr
+    char ']'
+    spaces
+    return (Array t e)
+
 plain_type :: Parser PlainType
 plain_type = (
     trykw "u8" U8 <|>
@@ -154,7 +185,11 @@ plain_type = (
     trykw "u16x" U16X <|>
     trykw "u16y" U16Y <|>
     trykw "u16z" U16Z <|>
-    trykw "u16v" U16V)
+    trykw "u16v" U16V <|>
+    trykw "u64" U64 <|>
+    trykw "i8" I8 <|>
+    trykw "i32" I32 <|>
+    array_type)
 
 rm_type :: Parser Type
 rm_type = do
@@ -162,6 +197,23 @@ rm_type = do
     spaces
     t <- plain_type
     return (ByRM t)
+
+{-mut_mem_type :: Parser Type
+mut_mem_type = do
+    try (char '&' >> spaces >> kw "mut")
+    t <- plain_type
+    return (MutMem t)-}
+
+switch_type :: Parser Type
+switch_type = do
+    try (char '&' >> spaces >> char '(')
+    spaces
+    t0 <- typ
+    arrow
+    t1 <- typ
+    char ')'
+    spaces
+    return (Switch t0 t1)
 
 mem_type :: Parser Type
 mem_type = do
@@ -177,13 +229,31 @@ known_type = do
     t <- plain_type
     return (Known t)
 
+uninit_type :: Parser Type
+uninit_type = do
+    try (char '&' >> spaces >> kw "uninitialized")
+    t <- plain_type
+    return (Uninitialized t)
+
+dnr_type :: Parser Type
+dnr_type = trykw "doesnotreturn" DoesNotReturn
+
+void_type :: Parser Type
+void_type = trykw "void" Void
+
 reg_type :: Parser Type
 reg_type = do
     t <- plain_type
     return (ByReg t)
 
 typ :: Parser Type
-typ = rm_type <|> mem_type <|> known_type <|> reg_type
+typ = rm_type <|> switch_type <|> uninit_type <|> dnr_type <|> void_type <|> mem_type <|> known_type <|> reg_type
+
+uninit :: Parser Expr
+uninit = do
+    try (char '&' >> spaces >> kw "uninitialized")
+    t <- plain_type
+    return (Uninit t)
 -------------------------
 
 parse_vex :: Parser AsmVex
@@ -202,12 +272,13 @@ parse_prefix = (
     trykw "(66)" Optional66 <|>
     trykw "66" Prefix66 <|>
     trykw "F3" PrefixF3 <|>
-    trykw "F2" PrefixF2)
+    trykw "F2" PrefixF2 <|>
+    return NoPrefix)
 
 parse_mmmmm :: Parser AsmM
-parse_mmmmm = do
-    kw "0F"
-    (trykw "38" M0F38) <|> (trykw "3A" M0F3A) <|> return M0F
+parse_mmmmm =
+    (try (kw "0F") >>
+        (trykw "38" M0F38) <|> (trykw "3A" M0F3A) <|> return M0F) <|> return NoM
 
 parse_w :: Parser AsmW
 parse_w = (
@@ -222,26 +293,38 @@ parse_op = do
     spaces
     return $ read ['0','x',upper_nibble,lower_nibble]
 
+parse_plusr :: Parser Bool
+parse_plusr = do
+    option False (trykw "+r" True)
+
 parse_slash :: Parser (Maybe Word8)
 parse_slash = optionMaybe (do
     try (char '/')
     d <- oneOf "01234567"
+    spaces
     return $ read [d])
+
+parse_mr :: Parser Bool
+parse_mr = option False (trykw "MR" True)
 
 asm_def :: Parser AsmDef
 asm_def = do
+    mr <- parse_mr
     vex <- parse_vex
     prefix <- parse_prefix
     mmmmm <- parse_mmmmm
     w <- parse_w
     op <- parse_op
+    plusr <- parse_plusr
     slash <- parse_slash
     return $ AsmDef {
+        asm_mr = mr,
         asm_vex = vex,
         asm_prefix = prefix,
         asm_mmmmm = mmmmm,
         asm_w = w,
         asm_op = op,
+        asm_plusr = plusr,
         asm_slash = slash
         }
 
@@ -252,6 +335,15 @@ typed_arg = do
     colon
     t <- typ
     return (x,t)
+
+mut_expr :: Parser Expr
+mut_expr = do
+    try (kw "mut")
+    e <- expr
+    return (MutParam e)
+
+actual_param :: Parser Expr
+actual_param = mut_expr <|> expr
 
 literal_list :: Parser Expr
 literal_list = do
@@ -266,48 +358,85 @@ word_expr = do
     return $ Var x
 
 expr1 :: Parser Expr
-expr1 = literal_list <|> word_expr <|> number_any
+expr1 = literal_list <|> word_expr <|> number_any <|> uninit
 
-dot_method :: Expr -> Parser Expr
-dot_method e = do
+dot_method :: Parser (Expr->Expr)
+dot_method = do
     dot
     m <- word
     open_paren
-    args <- expr `sepBy` comma
+    args <- actual_param `sepBy` comma
     close_paren
-    return $ MethodCall e m args
+    return (\e -> MethodCall e m args)
 
-suffixes :: a -> (a -> Parser a) -> Parser a
+array_lookup :: Parser (Expr->Expr)
+array_lookup = do
+    char '['
+    spaces
+    index <- expr
+    string "..+"
+    spaces
+    count <- expr
+    char ']'
+    spaces
+    return (\e -> Slice e index count)
+
+suffixes :: a -> (Parser (a->a)) -> Parser a
 suffixes init sfx = do
-    o <- optionMaybe (sfx init)
+    o <- optionMaybe sfx
     case o of
         Nothing -> return init
-        Just result -> suffixes result sfx
+        Just f -> suffixes (f init) sfx
+
+term :: Parser Expr
+term = do
+    e <- expr1
+    suffixes e (dot_method <|> array_lookup)
+
+comparison :: Parser (Expr->Expr)
+comparison = do
+    string ">="
+    spaces
+    e <- expr
+    return (\l -> Le e l)
 
 expr :: Parser Expr
 expr = do
+    e <- term
+    o <- optionMaybe comparison
+    case o of
+        Nothing -> return e
+        Just f -> return (f e)
+
+lhs :: Parser Expr
+lhs = do
     e <- expr1
-    suffixes e dot_method
+    suffixes e array_lookup
+
+return_thing :: Parser (String,Type)
+return_thing = do
+    t <- typ
+    x <- option "" (do
+        char '@'
+        spaces
+        word)
+    return (x,t)
 
 assignment :: Parser Statement
 assignment = do
-    x <- try(do
-        x <- word
+    xs <- try(do
+        xs <- lhs `sepBy` comma
         equals
-        return x)
+        return xs)
     e <- expr
     newline
-    return $ Assign x e
+    return $ Assign xs e
 
-call_statement :: Parser Statement
-call_statement = do
-    try kw_call
-    f <- word
-    open_paren
-    args <- expr `sepBy` comma
-    close_paren
+expr_statement :: Parser Statement
+expr_statement = do
+    e <- try expr
     newline
-    return $ Call f args
+    return $ PlainExpr e
 
 exit_statement :: Parser Statement
 exit_statement = do
@@ -358,12 +487,43 @@ primitive_fn_statement = do
     rt <- typ
     equals
     asm <- asm_def
+    incidental <- option False (trykw "incidental" True)
     newline
-    return (PrimitiveFn f args rt asm)
+    return (PrimitiveFn f args rt asm incidental)
+
+syscall_fn_statement :: Parser Statement
+syscall_fn_statement = do
+    try kw_syscall
+    kw_fn
+    f <- word
+    open_paren
+    args <- typed_arg `sepBy` comma
+    close_paren
+    arrow
+    rts <- return_thing `sepBy` comma
+    equals
+    n <- number
+    newline
+    return (SyscallFn f args rts (fromIntegral n))
+
+loop_statement :: Parser Statement
+loop_statement = do
+    try (kw "loop")
+    newline
+    contents <- manyTill statement (kw "endloop" >> newline)
+    return (Loop contents)
+
+break_if_statement :: Parser Statement
+break_if_statement = do
+    try (kw "break")
+    kw "if"
+    e <- expr
+    newline
+    return (BreakIf e)
 
 statement :: Parser Statement
-statement = assignment <|> exit_statement <|> print_statement <|> call_statement <|> write_statement <|> return_statement
-    <|> fn_statement <|> primitive_fn_statement
+statement = assignment <|> exit_statement <|> print_statement <|> write_statement <|> return_statement
+    <|> fn_statement <|> primitive_fn_statement <|> syscall_fn_statement <|> loop_statement <|> break_if_statement <|> expr_statement
 
 file :: Parser [Statement]
 file = do

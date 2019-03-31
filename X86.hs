@@ -8,7 +8,7 @@ import Data.Word (Word8,Word16,Word32,Word64)
 data Code = Code Builder Int
 
 data Reg = Xmm Word8 | Gpr Word8 | NoReg | Slash Word8 deriving (Eq,Show)
-data RM = R Reg | AbsMem Int | RegMem Reg | NoRM deriving Eq
+data RM = R Reg | AbsMem Int | RegMem Reg Int | SibMem Int Reg Reg Int | NoRM deriving Eq
 data Opcode = I_0F Word8 | I_66_0F Word8 | I_F3_0F Word8 | I_66_0F38 Word8 | I_66_0F_slash Word8 Word8
 data OpcodeO = Old_OI Word8 Int Word8 | Old_MI_slash Word8 Int Word8 Word8 | Old_RM Word8 Word8
     | Old_I Word8 Int Word8 | Old_ZO Word8 Word8
@@ -126,6 +126,37 @@ old_zo (Old_ZO w op) =
     in
         mrex <> b op
 
+old_misc :: Word8 -> Word8 -> Word8 -> Word8 -> Reg -> RM -> Code -> Code
+old_misc w pp mmmmm op (Gpr reg) rm imm =
+    let
+        mrex = maybe_rex (Gpr reg) rm w
+    in
+        old_pp pp <> mrex <> old_mmmmm mmmmm <> b op <> modrm_sib_disp (Gpr reg) rm <> imm
+old_misc w pp mmmmm op (Slash n) rm imm =
+    let
+        mrex = maybe_rex (Slash n) rm w
+    in
+        old_pp pp <> mrex <> old_mmmmm mmmmm <> b op <> modrm_sib_disp (Slash n) rm <> imm
+
+old_misc_no_modrm :: Word8 -> Word8 -> Word8 -> Word8 -> Code -> Code
+old_misc_no_modrm w pp mmmmm op imm =
+    let
+        mrex = maybe_rex NoReg NoRM w
+    in
+        old_pp pp <> mrex <> old_mmmmm mmmmm <> b op <> imm
+
+old_pp :: Word8 -> Code
+old_pp 0 = mempty
+old_pp 1 = bytes [0x66]
+old_pp 2 = bytes [0xf3]
+old_pp 3 = bytes [0xf2]
+
+old_mmmmm :: Word8 -> Code
+old_mmmmm 0 = mempty
+old_mmmmm 1 = bytes [0x0f]
+old_mmmmm 2 = bytes [0x0f,0x38]
+old_mmmmm 3 = bytes [0x0f,0x3a]
+
 ------------------------
 
 vex128_rm :: Opcode -> Reg -> RM -> Code
@@ -206,6 +237,31 @@ get_r (Slash reg) = reg .&. 7
 get_vvvv (Xmm reg) = 15 - (reg .&. 15)
 get_vvvv NoReg = 15
 
+get_ss :: Int -> Word8
+get_ss 1 = 0
+get_ss 2 = 1
+get_ss 4 = 2
+get_ss 8 = 3
+
+get_index :: Reg -> Word8
+get_index (Gpr 4) = error ("get_index: RSP cannot be used as index")
+get_index (Gpr n) = n .&. 7
+get_index NoReg = 4
+
+get_base :: Reg -> Word8
+get_base (Gpr n) = n .&. 7
+get_base NoReg = 4
+
+get_mod_and_disp_width_for_sib :: RM -> (Word8,Int)
+get_mod_and_disp_width_for_sib (SibMem _ _ NoReg disp)
+    | disp >= -0x80000000 && disp <= 0x7fffffff = (0,4)    -- mode 0 doesn't normally come with a disp, but in case b=5 it does
+    | otherwise = error ("get_mod_for_disp: disp " ++ show disp ++ " is out of range")
+get_mod_and_disp_width_for_sib (SibMem _ _ (Gpr b) disp)
+    | b /= 5 && disp == 0 = (0,0)
+    | disp >= -0x80 && disp <= 0x7f = (1,1)
+    | disp >= -0x80000000 && disp <= 0x7fffffff = (2,4)
+    | otherwise = error ("get_mod_for_disp: disp " ++ show disp ++ " is out of range")
+
 modrm_sib_disp :: Reg -> RM -> Code
 modrm_sib_disp reg (AbsMem addr) =
     let
@@ -220,7 +276,23 @@ modrm_sib_disp reg (AbsMem addr) =
         disp = int_as_four_bytes addr
     in
         b modrm <> b sib <> disp
-modrm_sib_disp reg (RegMem (Gpr 4)) =   -- RSP
+
+modrm_sib_disp reg (SibMem scale indexreg basereg displ) =
+    let
+        r = get_r reg
+        (mod,width) = get_mod_and_disp_width_for_sib (SibMem scale indexreg basereg displ)
+        rm = 4
+        modrm = (mod `shiftL` 6) .|. (r `shiftL` 3) .|. rm
+        base = get_base basereg
+        index = get_index indexreg
+        ss = get_ss scale
+        sib = (ss `shiftL` 6) .|. (index `shiftL` 3) .|. base
+        disp = int_as_n_bytes width displ
+    in
+        b modrm <> b sib <> disp
+
+{-
+modrm_sib_disp reg (RegMem (Gpr 4) 0) =   -- RSP
     let
         r = get_r reg
         mod = 0
@@ -232,6 +304,7 @@ modrm_sib_disp reg (RegMem (Gpr 4)) =   -- RSP
         sib = (ss `shiftL` 6) .|. (index `shiftL` 3) .|. base
     in
         b modrm <> b sib
+-}
 modrm_sib_disp reg (R reg') =
     let
         r = get_r reg
@@ -250,16 +323,22 @@ rex_r NoReg = 0
 rex_x :: RM -> Word8
 rex_x (R _) = 0
 rex_x (AbsMem _) = 0
-rex_x (RegMem (Gpr r))
-    | r < 8 = 0
+rex_x (RegMem (Gpr r) _) = 0
+rex_x (SibMem _ (Gpr i) _ _)
+    | i == 4 = error "rex_x: RSP being used as index"
+    | otherwise = (i .&. 8) `shiftR` 3
+rex_x (SibMem _ NoReg _ _) = 0
 rex_x NoRM = 0
 
 rex_b :: RM -> Word8
 rex_b (R (Xmm n)) = (n .&. 8) `shiftR` 3
 rex_b (R (Gpr n)) = (n .&. 8) `shiftR` 3
 rex_b (AbsMem _) = 0
-rex_b (RegMem (Gpr r))
-    | r < 8 = 0
+rex_b (RegMem (Gpr r) _)
+    | r == 4 = error ("rex_b: detected RegMem RSP")
+    | otherwise = (r .&. 8) `shiftR` 3
+rex_b (SibMem _ _ (Gpr b) _) = (b .&. 8) `shiftR` 3
+rex_b (SibMem _ _ NoReg _) = 0
 rex_b NoRM = 0
 
 maybe_rex :: Reg -> RM -> Word8 -> Code
